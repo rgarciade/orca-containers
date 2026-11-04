@@ -1,0 +1,21 @@
+{
+  "manifestVersion": 2,
+  "execution": "trusted-worker",
+  "id": "colima",
+  "publisher": "local",
+  "name": "Colima",
+  "version": "0.1.0",
+  "description": "Right-sidebar panel to manage the Colima/Docker containers of the active worktree.",
+  "engines": { "orca": ">=1.4.246" },
+  "pluginApi": 1,
+  "main": "worker.mjs",
+  "contributes": {
+    "panels": [
+      { "id": "colima", "title": "Colima", "icon": "package", "entry": "panel/index.html" }
+    ],
+    "commands": [
+      { "id": "colima.refresh", "title": "Colima: refresh" }
+    ]
+  },
+  "capabilities": [{ "kind": "notifications:show" }, { "kind": "workspace:read" }, { "kind": "storage:own" }]
+}

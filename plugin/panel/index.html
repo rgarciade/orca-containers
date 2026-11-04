@@ -1,0 +1,895 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Colima</title>
+<style>
+  body { font: 12px/1.4 -apple-system, sans-serif; background: var(--orca-background); color: var(--orca-foreground); margin: 0; padding: 10px; }
+  h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; margin: var(--space-m) 0 0; color: var(--orca-muted-foreground); }
+  .msg { color: var(--orca-muted-foreground); padding: 8px 0; }
+  .err { color: #f85149; border: 1px solid var(--orca-border); border-radius: 4px; padding: 8px; background: var(--orca-card); }
+  /* One spacing scale for every block: blocks are separated by a border with --space-l around it. */
+  :root { --space-s: 6px; --space-m: 10px; --space-l: 14px; }
+  .item { border-bottom: 1px solid var(--orca-border); padding: var(--space-m) 0 var(--space-l); }
+  .name { font-weight: 600; word-break: break-all; }
+  .running { color: #3fb950; } .exited { color: var(--orca-muted-foreground); }
+  .sub { color: var(--orca-muted-foreground); font-size: 11px; word-break: break-all; }
+  .row { display: flex; gap: 8px; margin-top: var(--space-m); flex-wrap: wrap; }
+  button { font: inherit; background: var(--orca-secondary); color: var(--orca-secondary-foreground); border: 1px solid var(--orca-border); border-radius: 4px; padding: 3px 10px; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  pre { background: var(--orca-card); border: 1px solid var(--orca-border); padding: 8px; max-height: 40vh; overflow: auto; white-space: pre-wrap; word-break: break-all; margin: 4px 0; }
+  /* Layout: VM and Compose are side-by-side cards (wrapping when narrow); containers are a list below. */
+  .top { display: flex; flex-wrap: wrap; gap: var(--space-m); align-items: stretch; }
+  .card { flex: 1 1 220px; min-width: 0; background: var(--orca-card, rgba(255, 255, 255, .03)); border: 1px solid var(--orca-border); border-radius: 8px; padding: 12px; }
+  .card:empty { display: none; }
+  .card-title, .section-title { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; color: var(--orca-muted-foreground); margin: 0 0 var(--space-s); }
+  .section-title { margin: var(--space-l) 0 var(--space-s); display: flex; gap: 6px; }
+  .section-title .count { font-weight: 400; }
+  .group-title { font-size: 11px; color: var(--orca-muted-foreground); padding: var(--space-s) 12px; background: var(--orca-card, rgba(255, 255, 255, .03)); border-bottom: 1px solid var(--orca-border); }
+  .list { border: 1px solid var(--orca-border); border-radius: 8px; overflow: hidden; }
+  .list .item { padding: var(--space-m) 12px 12px; }
+  .list .item:last-child { border-bottom: none; }
+  .vm-line { font-weight: 600; margin-bottom: 4px; }
+  .ports { display: flex; flex-wrap: wrap; gap: var(--space-s); margin-top: var(--space-s); }
+  .port { font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; border: 1px solid var(--orca-border); border-radius: 10px; padding: 1px 8px; background: var(--orca-card); }
+  .port b { color: #58a6ff; font-weight: 600; }
+  .port .arrow { color: var(--orca-muted-foreground); margin: 0 4px; }
+  .port.link { cursor: pointer; }
+  .port.link:hover { background: rgba(88, 166, 255, .14); border-color: #58a6ff; }
+  .port.internal { color: var(--orca-muted-foreground); border-style: dashed; background: transparent; }
+  .stopped { color: #f85149; } .starting { color: #d29922; }
+  .spin { display: inline-block; width: 9px; height: 9px; border: 2px solid var(--orca-border); border-top-color: currentColor; border-radius: 50%; animation: spin .8s linear infinite; vertical-align: -1px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .size { display: flex; gap: 16px; align-items: center; margin-top: var(--space-m); }
+  .size label { display: flex; gap: 6px; align-items: center; color: var(--orca-muted-foreground); font-size: 11px; }
+  .size select { font: inherit; background: var(--orca-card); color: var(--orca-foreground); border: 1px solid var(--orca-border); border-radius: 4px; padding: 3px 6px; }
+  .stack + .stack { border-top: 1px solid var(--orca-border); margin-top: var(--space-m); padding-top: var(--space-m); }
+  .stack .name { font-weight: 600; word-break: break-all; }
+  .stack .files { word-break: break-all; }
+  .stack-err { color: #f85149; font-size: 11px; margin-top: 4px; white-space: pre-wrap; word-break: break-all; }
+  button.danger { color: #f85149; }
+  #status { color: var(--orca-muted-foreground); font-size: 11px; margin-top: var(--space-s); }
+  #status:empty { display: none; }
+  .stats { margin-top: var(--space-s); font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--orca-muted-foreground); }
+  .stats:empty { display: none; }
+  .bar { height: 3px; border-radius: 2px; background: var(--orca-border); margin-top: 3px; width: 33%; min-width: 80px; max-width: 100%; overflow: hidden; }
+  .bar > i { display: block; height: 100%; background: #58a6ff; }
+  .bar.mem > i { background: #3fb950; }
+  .logs-head { display: flex; align-items: center; gap: var(--space-m); margin-top: var(--space-l); }
+  .logs-head h2 { margin: 0; flex: 1; min-width: 0; word-break: break-all; }
+  .ln { min-height: 1.3em; }
+  .ln .ts { color: var(--orca-muted-foreground); opacity: .6; margin-right: 8px; user-select: none; }
+  #logs-older { text-align: center; margin-bottom: 4px; color: var(--orca-muted-foreground); font-size: 11px; }
+  #logs-older:empty { display: none; }
+  #logs-state { color: var(--orca-muted-foreground); font-size: 11px; white-space: nowrap; }
+  #logs-state .live { color: #3fb950; }
+  #logs-search { display: flex; align-items: center; gap: var(--space-s); flex-wrap: wrap; margin-top: var(--space-s); }
+  #logs-search[hidden] { display: none; }
+  #logs-q { flex: 1 1 140px; min-width: 0; font: inherit; background: var(--orca-card); color: var(--orca-foreground); border: 1px solid var(--orca-border); border-radius: 4px; padding: 3px 6px; }
+  button[aria-pressed] { min-width: 28px; }
+  button[aria-pressed="true"], button.on { background: rgba(88, 166, 255, .28); border-color: #58a6ff; color: var(--orca-foreground); font-weight: 700; box-shadow: inset 0 0 0 1px #58a6ff; }
+  #logs-count { color: var(--orca-muted-foreground); font-size: 11px; }
+  mark { background: rgba(210, 153, 34, .35); color: inherit; border-radius: 2px; }
+  .hit { cursor: pointer; }
+  .hit:hover { background: rgba(127, 127, 127, .12); }
+  .hit.cur { background: rgba(88, 166, 255, .14); box-shadow: inset 2px 0 0 #58a6ff; }
+  .hit.cur mark { background: rgba(210, 153, 34, .75); }
+  .ln.focus { background: rgba(88, 166, 255, .18); box-shadow: inset 2px 0 0 #58a6ff; }
+  #logs-context-bar { margin-bottom: 4px; }
+  #logs-results .msg { padding: 4px 0; }
+</style>
+</head>
+<body>
+<div class="top">
+  <div id="vm" class="card"></div>
+  <div id="compose" class="card"></div>
+</div>
+<div id="status"></div>
+<div id="content"><div class="msg">Loading...</div></div>
+<div id="logs-wrap" hidden>
+  <div class="logs-head">
+    <h2 id="logs-title"></h2>
+    <span id="logs-state"></span>
+    <button id="logs-mode">History</button>
+    <button id="logs-close">close</button>
+  </div>
+  <div id="logs-search" hidden>
+    <input id="logs-q" type="text" maxlength="200" placeholder="Search full history" autocomplete="off" spellcheck="false">
+    <button id="logs-case" title="Match case" aria-pressed="false">Aa</button>
+    <button id="logs-prev" title="Previous match (Shift+Enter)" disabled>&uarr;</button>
+    <button id="logs-next" title="Next match (Enter)" disabled>&darr;</button>
+    <span id="logs-count"></span>
+  </div>
+  <pre id="logs"><div id="logs-older"></div><div id="logs-lines"></div><div id="logs-results" hidden></div><div id="logs-context" hidden></div></pre>
+</div>
+<script>
+  const POLL_MS = 3000
+  let state = null
+  let busy = false
+  let logsId = null
+  let logsLive = false // a follower is running for logsId
+  let logsMode = 'live' // 'live' (follower) or 'history' (paging + search)
+  let logsEpoch = 0 // bumped on every mode switch / close: stale async results are dropped
+  let logsView = 'tail' // history mode only: 'tail' | 'results' | 'context'
+  let searchSeq = 0
+  let searchTimer = null
+  let searchCase = false
+  let searchDone = null // { query, caseSensitive } of the results on screen
+  let hits = [] // result line elements
+  let hitIdx = -1
+  let resultsScroll = 0
+  let logsPartial = '' // trailing text of the stream that has no newline yet
+  let logsOlderDone = false // the start of the logs was reached
+  let logsOlderBusy = false
+  const LOGS_MAX_LINES = 20000
+  const SEARCH_DEBOUNCE_MS = 300
+  const STATS_MS = 5000
+  let stats = {} // container id -> latest stats from the worker
+  let statsKey = null // workspace context the stats belong to
+  let statsBusy = false
+  let statsTimer = null
+  let timer = null
+  let vm = null
+  let startError = null
+  let size = null // { cpu, memory } chosen in the panel; seeded from saved prefs
+  const CONTEXT_CHECK_MS = 700
+  let shownKey = null // workspace context of the state on screen
+  let searching = true // no result yet for the focused workspace
+  let ctxTimer = null
+  let eventsLive = false // workspace.changed has been received: the polling watcher is not needed
+  const OP_LABELS = { up: 'Starting…', down: 'Stopping…', restart: 'Restarting…' }
+  const CONFIRM_MS = 4000
+  let confirmId = null // stack whose Down button is waiting for confirmation
+  let confirmTimer = null
+  const composeErrors = {} // stack id -> last failure message
+  const GB = 1024 ** 3
+
+  const $ = (id) => document.getElementById(id)
+  const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]))
+
+  async function request(name, input) {
+    const res = await window.orca.host.call('plugin.request', { name, input, timeoutMs: 30000 })
+    return res.output
+  }
+
+  let statusTimer = null
+  function setStatus(text, ttlMs) {
+    clearTimeout(statusTimer)
+    $('status').textContent = text || ''
+    if (text && ttlMs) statusTimer = setTimeout(() => { if ($('status').textContent === text) $('status').textContent = '' }, ttlMs)
+  }
+
+  // Copies text. The panel runs in a sandboxed frame, so the async Clipboard API may be refused:
+  // fall back to execCommand, and as a last resort leave the text selected in the status line.
+  async function copyText(text) {
+    try {
+      await navigator.clipboard.writeText(text)
+      return true
+    } catch { /* not allowed in this frame: try the legacy path */ }
+    const ta = document.createElement('textarea')
+    ta.value = text
+    ta.setAttribute('readonly', '')
+    ta.style.cssText = 'position:fixed;top:0;left:0;opacity:0;pointer-events:none'
+    document.body.appendChild(ta)
+    ta.select()
+    let ok = false
+    try { ok = document.execCommand('copy') } catch { ok = false }
+    ta.remove()
+    return ok
+  }
+
+  async function copyPort(text) {
+    if (await copyText(text)) { setStatus(`Copied ${text}`, 2000); return }
+    setStatus(`Could not copy automatically. Select and copy: ${text}`)
+    const range = document.createRange()
+    range.selectNodeContents($('status'))
+    const sel = window.getSelection()
+    sel.removeAllRanges()
+    sel.addRange(range)
+  }
+
+  const gb = (b) => `${Math.round(b / GB)} GB`
+  const fmtBytes = (b) => (b >= GB ? `${(b / GB).toFixed(1)} GB` : `${Math.round(b / 1024 ** 2)} MB`)
+  const clampPct = (n) => Math.max(0, Math.min(100, Number(n) || 0))
+
+  // Compact usage block for a running container; empty until the first stats arrive.
+  function statsHtml(id) {
+    const st = stats[id]
+    if (!st) return ''
+    return `<div>CPU ${esc(st.cpuPercent.toFixed(1))}% &middot; MEM ${esc(fmtBytes(st.memUsage))} / ${esc(fmtBytes(st.memLimit))}</div>
+      <div class="bar" title="CPU"><i style="width:${clampPct(st.cpuPercent)}%"></i></div>
+      <div class="bar mem" title="Memory"><i style="width:${clampPct(st.memPercent)}%"></i></div>`
+  }
+
+  // Updates only the stats blocks in place, so rows (buttons, focus, confirm state) are untouched.
+  function applyStats() {
+    for (const el of document.querySelectorAll('.stats[data-id]')) el.innerHTML = statsHtml(el.dataset.id)
+  }
+
+  async function pollStats() {
+    if (statsBusy || searching || !state || state.error || !state.worktree) return
+    if (!state.containers.some((c) => c.state === 'running')) { stats = {}; statsKey = shownKey; applyStats(); return }
+    statsBusy = true
+    const key = shownKey
+    try {
+      const r = await request('colima.stats', {})
+      if (key !== shownKey || searching) return // workspace changed meanwhile: stale
+      if (r.ok) { stats = r.stats || {}; statsKey = key; applyStats() }
+    } catch { /* stats are best-effort; the next tick retries */ }
+    finally { statsBusy = false }
+  }
+
+  const MEM_STEPS = [1, 2, 4, 6, 8, 12, 16, 20, 24, 32, 48, 64, 96, 128, 192, 256]
+  const cpuChoices = (max) => Array.from({ length: max }, (_, i) => i + 1)
+  // Common sizes up to the host limit, plus the saved value if it is not one of them.
+  const memChoices = (max, current) =>
+    [...new Set([...MEM_STEPS.filter((n) => n <= max), current])].filter((n) => n >= 1 && n <= max).sort((a, b) => a - b)
+  // Docker's Ports column, e.g. "0.0.0.0:5432->5432/tcp, :::5432->5432/tcp, 6379/tcp".
+  // Returns published (host -> container) and internal-only ports, deduping IPv4/IPv6 twins.
+  function parsePorts(text) {
+    const published = new Map()
+    const internal = new Set()
+    for (const part of String(text || '').split(',').map((s) => s.trim()).filter(Boolean)) {
+      const m = part.match(/^(?:(.*):)?(\d+(?:-\d+)?)->(\d+(?:-\d+)?)\/(\w+)$/)
+      if (m) {
+        const host = !m[1] || m[1] === '0.0.0.0' || m[1] === '::' || m[1] === '[::]' ? 'localhost' : m[1]
+        published.set(`${host}:${m[2]}>${m[3]}/${m[4]}`, { host, hostPort: m[2], port: m[3], proto: m[4] })
+      } else internal.add(part)
+    }
+    const exposed = new Set([...published.values()].map((p) => `${p.port}/${p.proto}`))
+    return { published: [...published.values()], internal: [...internal].filter((p) => !exposed.has(p)) }
+  }
+
+  // Address a published port is reachable at from the host; null for UDP and port ranges.
+  // Bracketed IPv6 stays as-is, a bare IPv6 gets brackets.
+  function portTarget(p) {
+    if (p.proto !== 'tcp' || !/^\d{1,5}$/.test(p.hostPort)) return null
+    const host = /^[\w.\-]+$|^\[[0-9a-fA-F:.]+\]$/.test(p.host) ? p.host : /^[0-9a-fA-F:.]+$/.test(p.host) ? `[${p.host}]` : null
+    return host ? { url: `http://${host}:${p.hostPort}`, text: `${host}:${p.hostPort}` } : null
+  }
+
+  function renderPorts(text) {
+    const { published, internal } = parsePorts(text)
+    if (!published.length && !internal.length) return ''
+    const pub = published.map((p) => {
+      const t = portTarget(p)
+      const label = `<b>${esc(p.host === 'localhost' ? '' : p.host + ':')}${esc(p.hostPort)}</b><span class="arrow">→</span>${esc(p.port)}${p.proto === 'tcp' ? '' : '/' + esc(p.proto)}`
+      if (!t) return `<span class="port">${label}</span>`
+      return `<span class="port link" role="button" tabindex="0" data-copy="${esc(t.text)}" aria-label="Copy ${esc(t.text)}">${label}</span>`
+    }).join('')
+    const int = internal.map((p) => `<span class="port internal">${esc(p.replace('/tcp', ''))}</span>`).join('')
+    return `<div class="ports">${pub}${int}</div>`
+  }
+
+  const options = (values, selected, unit = '') =>
+    values.map((n) => `<option value="${n}"${n === selected ? ' selected' : ''}>${n}${unit}</option>`).join('')
+
+  function renderVm() {
+    const el = $('vm')
+    if (!vm) { el.innerHTML = ''; return }
+    if (!size) size = { ...vm.prefs }
+    // Polling must not rebuild the selectors while the user has one open.
+    if (el.contains(document.activeElement) && document.activeElement.tagName === 'SELECT') return
+    const dockerDown = Boolean(state && state.error)
+    let cls = vm.running ? 'running' : 'stopped'
+    let label = vm.running ? 'running' : 'stopped'
+    if (vm.starting) { cls = 'starting'; label = 'starting' }
+    const specs = vm.running
+      ? `<div class="sub">${esc(vm.cpu)} CPU &middot; ${esc(gb(vm.memory))} RAM &middot; ${esc(gb(vm.disk))} disk${vm.runtime ? ' &middot; ' + esc(vm.runtime) : ''}${vm.arch ? ' &middot; ' + esc(vm.arch) : ''}</div>`
+      : ''
+    const missing = vm.installed === false ? '<div class="sub">colima binary not found.</div>' : ''
+    const canStart = vm.installed !== false && (!vm.running || dockerDown)
+    const btn = vm.starting
+      ? '<div class="row"><button disabled><span class="spin"></span> Starting&hellip;</button></div>'
+      : canStart ? `<div class="size">
+          <label>CPU <select id="size-cpu">${options(cpuChoices(vm.limits.maxCpu), size.cpu)}</select></label>
+          <label>RAM <select id="size-mem">${options(memChoices(vm.limits.maxMemory, size.memory), size.memory, ' GB')}</select></label>
+        </div>
+        <div class="row"><button data-a="vm-start">Start Colima (${esc(size.cpu)} CPU, ${esc(size.memory)} GB)</button></div>` : ''
+    const err = startError ? `<div class="err" style="margin-top:6px">Start failed: <span class="sub">${esc(startError)}</span></div>` : ''
+    el.innerHTML = `<div class="card-title">Colima VM</div><div class="vm-line"><span class="${cls}">&#9679;</span> ${label[0].toUpperCase() + label.slice(1)}</div>${specs}${missing}${btn}${err}`
+  }
+
+  function renderStack(s) {
+    const title = s.project || s.files[0] || s.id
+    const files = s.files.length ? `<div class="sub files">${esc(s.files.join(', '))}</div>` : ''
+    const count = `<div class="sub">${esc(s.running)}/${esc(s.total)} running</div>`
+    const bits = s.op
+      ? `<div class="sub"><span class="spin"></span> ${esc(OP_LABELS[s.op] || 'Working…')}</div>`
+      : ''
+    const off = s.op ? ' disabled' : ''
+    const confirming = confirmId === s.id
+    const buttons = [
+      s.canUp ? `<button data-a="compose" data-t="${esc(s.id)}" data-c="up"${off}>Up</button>` : '',
+      s.total > 0 ? `<button data-a="compose" data-t="${esc(s.id)}" data-c="restart"${off}>Restart</button>` : '',
+      s.total > 0 ? `<button class="danger" data-a="compose" data-t="${esc(s.id)}" data-c="down"${off}>${confirming ? 'Confirm down?' : 'Down'}</button>` : ''
+    ].join('')
+    const err = composeErrors[s.id] ? `<div class="stack-err">${esc(composeErrors[s.id])}</div>` : ''
+    return `<div class="stack"><div class="name">${esc(title)}</div>${files}${count}${bits}<div class="row">${buttons}</div>${err}</div>`
+  }
+
+  // Fills the Compose card next to the VM card; empty (and hidden) when there is nothing to show.
+  function renderCompose() {
+    const ok = !searching && state && !state.error && state.worktree
+    const stacks = ok ? state.stacks || [] : []
+    $('compose').innerHTML = stacks.length ? `<div class="card-title">Compose</div>${stacks.map(renderStack).join('')}` : ''
+  }
+
+  function renderContainer(c) {
+    return `<div class="item">
+        <div class="name"><span class="${esc(c.state)}">&#9679;</span> ${esc(c.name)}</div>
+        <div class="sub">${esc(c.status)}</div>
+        ${renderPorts(c.ports)}
+        ${c.state === 'running' ? `<div class="stats" data-id="${esc(c.id)}">${statsHtml(c.id)}</div>` : ''}
+        <div class="row">
+          <button data-a="logs" data-t="${esc(c.id)}">logs</button>
+          <button data-a="${c.state === 'running' ? 'stop' : 'start'}" data-t="${esc(c.id)}">${c.state === 'running' ? 'stop' : 'start'}</button>
+          <button data-a="shell" data-t="${esc(c.id)}">shell</button>
+        </div>
+      </div>`
+  }
+
+  function render() {
+    renderVm()
+    renderCompose()
+    const el = $('content')
+    if (searching || !state) {
+      el.innerHTML = '<div class="msg"><span class="spin"></span> Looking for containers in this worktree…</div>'
+      return
+    }
+    if (state.error && vm && (!vm.running || vm.starting)) {
+      // The VM header already says it is stopped; the raw socket error adds nothing.
+      el.innerHTML = `<div class="msg">${vm.starting ? 'Waiting for Colima to start…' : 'Start Colima to see containers.'}</div>`
+      return
+    }
+    if (state.error) {
+      el.innerHTML = `<div class="err"><b>Docker is unreachable.</b> Is Colima running?<br><span class="sub">${esc(state.error)}</span></div>`
+      return
+    }
+    if (!state.worktree) {
+      el.innerHTML = `<div class="msg">Could not identify the active worktree.${state.worktreeError ? ` ${esc(state.worktreeError)}` : ' Open a terminal in it.'}</div>`
+      return
+    }
+    const cs = state.containers
+    const running = cs.filter((c) => c.state === 'running').length
+    const title = `<div class="section-title">Containers <span class="count">${running}/${cs.length} running</span></div>`
+    if (cs.length === 0) { el.innerHTML = `${title}<div class="msg">No containers for this worktree.</div>`; return }
+    const groups = {}
+    for (const c of cs) (groups[c.service ? 'Compose services' : 'Standalone'] ||= []).push(c)
+    // Group headers only help when both kinds are present.
+    const many = Object.keys(groups).length > 1
+    el.innerHTML = title + `<div class="list">${Object.entries(groups).map(([g, items]) =>
+      `${many ? `<div class="group-title">${esc(g)}</div>` : ''}${items.map(renderContainer).join('')}`).join('')}</div>`
+  }
+
+  // Identifies the focused workspace, so a switch is noticed before the worker answers.
+  async function contextKey() {
+    try { return JSON.stringify(await window.orca.host.call('workspace.readContext', {})) } catch { return null }
+  }
+
+  // Cheap check between polls: on a workspace switch, show "looking" and fetch right away.
+  async function watchContext() {
+    const key = await contextKey()
+    if (key === shownKey) return
+    if (!searching) { searching = true; resetForWorkspaceSwitch(); render() }
+    refresh()
+  }
+
+  async function refresh() {
+    if (busy) return
+    busy = true
+    try {
+      const key = await contextKey()
+      if (key !== shownKey && !searching) { searching = true; resetForWorkspaceSwitch(); render() }
+      const [nextState, nextVm] = await Promise.all([request('colima.state', {}), request('colima.vm', {})])
+      vm = nextVm
+      // The workspace changed while the worker was answering: this result is stale.
+      if (key !== await contextKey()) { renderVm(); return }
+      state = nextState
+      shownKey = key
+      searching = false
+      render()
+      // The followed container left this worktree (or was removed): stop following.
+      if (logsId && !state.containers.some((c) => c.id === logsId)) closeLogs()
+      if (statsKey !== shownKey) pollStats()
+    } catch (err) {
+      state = null
+      $('content').innerHTML = `<div class="err">Worker error: ${esc(err.message)}</div>`
+    } finally {
+      busy = false
+      if (searching) setTimeout(watchContext, 0)
+    }
+  }
+
+  const LOGS_END_LABELS = { exited: 'Stopped (container exited)', idle: 'Stopped (panel was idle)', 'not-owned': 'Stopped (container left this worktree)', error: 'Stopped (docker error)' }
+
+  function resetForWorkspaceSwitch() {
+    stats = {}
+    statsKey = null
+    closeLogs()
+  }
+
+  function setLogsState(live, text) {
+    logsLive = live
+    const badge = $('logs-state')
+    if (logsMode === 'history') badge.textContent = 'History'
+    else if (live) badge.innerHTML = '<span class="live">&#9679; Live</span>'
+    else badge.textContent = text || ''
+  }
+
+  function resetLogView() {
+    logsPartial = ''
+    logsOlderDone = false
+    logsOlderBusy = false
+    $('logs-lines').textContent = ''
+    $('logs-results').textContent = ''
+    $('logs-context').textContent = ''
+    hits = []
+    hitIdx = -1
+    searchDone = null
+    searchSeq++
+    clearTimeout(searchTimer)
+    $('logs-q').value = ''
+    $('logs-count').textContent = ''
+    updateNav()
+    setLogsView('tail')
+    updateOlderBar()
+  }
+
+  function setLogsView(view) {
+    logsView = view
+    $('logs-older').hidden = view !== 'tail'
+    $('logs-lines').hidden = view !== 'tail'
+    $('logs-results').hidden = view !== 'results'
+    $('logs-context').hidden = view !== 'context'
+  }
+
+  function updateModeUi() {
+    const history = logsMode === 'history'
+    $('logs-mode').textContent = history ? 'Live' : 'History'
+    $('logs-search').hidden = !history
+  }
+
+  async function openLogs(id) {
+    const c = state && state.containers.find((x) => x.id === id)
+    logsId = id
+    logsEpoch++
+    resetLogView()
+    $('logs-title').textContent = `Logs: ${c ? c.name : id}`
+    $('logs-wrap').hidden = false
+    await startLive()
+  }
+
+  async function startLive() {
+    const id = logsId
+    const epoch = ++logsEpoch
+    logsMode = 'live'
+    resetLogView()
+    updateModeUi()
+    setLogsState(true)
+    try {
+      const r = await request('colima.logs.follow', { id })
+      if (logsId !== id || epoch !== logsEpoch) return // closed or switched while the worker was answering
+      if (!r.ok) { setStatus(r.message); closeLogs() }
+    } catch (err) {
+      if (logsId === id && epoch === logsEpoch) { setStatus(`logs failed: ${err.message}`); closeLogs() }
+    }
+  }
+
+  async function startHistory() {
+    const id = logsId
+    const epoch = ++logsEpoch
+    logsMode = 'history'
+    request('colima.logs.stop', {}).catch(() => {}) // follower (and any search) off
+    resetLogView()
+    updateModeUi()
+    setLogsState(false)
+    // Last page of history: everything older than "now" (plus a margin for clock skew).
+    await loadOlder(new Date(Date.now() + 5000).toISOString())
+    if (logsId === id && epoch === logsEpoch) $('logs-q').focus()
+  }
+
+  function closeLogs() {
+    if (!logsId) return
+    logsId = null
+    logsEpoch++
+    logsMode = 'live'
+    searchSeq++
+    clearTimeout(searchTimer)
+    setLogsState(false)
+    $('logs-wrap').hidden = true
+    request('colima.logs.stop', {}).catch(() => {})
+  }
+
+  const LINE_TS_RE = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})) ?/
+
+  // Splits a leading RFC3339Nano timestamp off a log line: { ts, rest } (ts is null when absent).
+  function splitTimestamp(line) {
+    const m = LINE_TS_RE.exec(line)
+    return m ? { ts: m[1], rest: line.slice(m[0].length) } : { ts: null, rest: line }
+  }
+
+  function shortTime(ts) {
+    const d = new Date(ts)
+    if (Number.isNaN(d.getTime())) return ts
+    const p = (n, w = 2) => String(n).padStart(w, '0')
+    return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}.${p(d.getMilliseconds(), 3)}`
+  }
+
+  function makeLine(line) {
+    const { ts, rest } = splitTimestamp(line)
+    const el = document.createElement('div')
+    el.className = 'ln'
+    if (ts) {
+      const t = document.createElement('span')
+      t.className = 'ts'
+      t.textContent = shortTime(ts)
+      el.dataset.ts = ts
+      el.title = ts
+      el.appendChild(t)
+    }
+    el.appendChild(document.createTextNode(rest))
+    return el
+  }
+
+  function lineCount() { return $('logs-lines').querySelectorAll('.ln:not(.partial)').length }
+  function firstTs() { const el = $('logs-lines').querySelector('.ln[data-ts]'); return el ? el.dataset.ts : null }
+
+  function updateOlderBar() {
+    const bar = $('logs-older')
+    if (!logsId || !firstTs()) { bar.textContent = ''; return }
+    if (logsOlderDone) { bar.textContent = 'Start of logs'; return }
+    if (lineCount() >= LOGS_MAX_LINES) { bar.textContent = 'Log view is full'; return }
+    bar.innerHTML = logsOlderBusy
+      ? '<button disabled><span class="spin"></span> Loading…</button>'
+      : '<button id="logs-load-older">Load older</button>'
+  }
+
+  // Appends a chunk as whole lines; trims from the top only when the user is at the bottom.
+  function appendLogs(text) {
+    const pre = $('logs')
+    const box = $('logs-lines')
+    const atBottom = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 24
+    const partialEl = box.querySelector('.partial')
+    if (partialEl) partialEl.remove()
+    const parts = (logsPartial + text).split('\n')
+    logsPartial = parts.pop()
+    const frag = document.createDocumentFragment()
+    for (const line of parts) frag.appendChild(makeLine(line.replace(/\r$/, '')))
+    if (logsPartial) {
+      const el = makeLine(logsPartial)
+      el.classList.add('partial')
+      frag.appendChild(el)
+    }
+    box.appendChild(frag)
+    if (atBottom) {
+      const excess = lineCount() - LOGS_MAX_LINES
+      if (excess > 0) {
+        for (let i = 0; i < excess; i++) box.firstElementChild.remove()
+        logsOlderDone = false // history beyond the trimmed top is reachable again
+      }
+      pre.scrollTop = pre.scrollHeight
+    }
+    updateOlderBar()
+  }
+
+  async function loadOlder(initialUntil) {
+    const id = logsId
+    const epoch = logsEpoch
+    const until = initialUntil || firstTs()
+    if (!id || !until || logsOlderBusy || logsOlderDone) return
+    logsOlderBusy = true
+    updateOlderBar()
+    try {
+      const r = await request('colima.logs.older', { id, until })
+      if (logsId !== id || epoch !== logsEpoch) return
+      if (!r.ok) { setStatus(`older logs failed: ${r.message}`); return }
+      const lines = r.text ? r.text.split('\n').filter((l) => l !== '') : []
+      const room = LOGS_MAX_LINES - lineCount()
+      const pre = $('logs')
+      const before = pre.scrollHeight
+      const top = pre.scrollTop
+      const frag = document.createDocumentFragment()
+      for (const line of lines.slice(-Math.max(room, 0))) frag.appendChild(makeLine(line.replace(/\r$/, '')))
+      $('logs-lines').prepend(frag)
+      if (r.done) logsOlderDone = true
+      logsOlderBusy = false
+      updateOlderBar()
+      pre.scrollTop = initialUntil ? pre.scrollHeight : top + (pre.scrollHeight - before) // keep the same line in view
+    } catch (err) {
+      if (logsId === id && epoch === logsEpoch) setStatus(`older logs failed: ${err.message}`)
+    } finally {
+      if (logsOlderBusy && epoch === logsEpoch) { logsOlderBusy = false; if (logsId === id) updateOlderBar() }
+    }
+  }
+
+  // ---- Search (history mode) ----
+  // Highlights every occurrence of the query. HTML is escaped first; the query only ever builds a RegExp
+  // from escaped literal text, so it cannot inject markup.
+  function highlightHtml(text, query, caseSensitive) {
+    const re = new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), caseSensitive ? 'g' : 'gi')
+    let out = ''
+    let last = 0
+    for (const m of text.matchAll(re)) {
+      out += esc(text.slice(last, m.index)) + '<mark>' + esc(m[0]) + '</mark>'
+      last = m.index + m[0].length
+    }
+    return out + esc(text.slice(last))
+  }
+
+  function makeHitLine(line, query, caseSensitive) {
+    const { ts, rest } = splitTimestamp(line)
+    const el = document.createElement('div')
+    el.className = 'ln hit'
+    if (ts) {
+      el.dataset.ts = ts
+      el.title = `${ts} (click for context)`
+    }
+    el.innerHTML = (ts ? `<span class="ts">${esc(shortTime(ts))}</span>` : '') + highlightHtml(rest, query, caseSensitive)
+    return el
+  }
+
+  function updateNav() {
+    $('logs-prev').disabled = hits.length < 2
+    $('logs-next').disabled = hits.length < 2
+  }
+
+  function setCountText(r) {
+    const n = r.lines.length
+    const pos = hitIdx >= 0 ? ` (${hitIdx + 1}/${n})` : ''
+    if (r.total === 0) $('logs-count').textContent = 'No matches'
+    else if (r.truncated) $('logs-count').textContent = `showing last ${n} of ${r.total}${pos}`
+    else $('logs-count').textContent = `${r.total} match${r.total === 1 ? '' : 'es'}${pos}`
+  }
+
+  let lastResult = null
+
+  function gotoHit(i) {
+    if (!hits.length) return
+    if (hitIdx >= 0 && hits[hitIdx]) hits[hitIdx].classList.remove('cur')
+    hitIdx = (i + hits.length) % hits.length
+    hits[hitIdx].classList.add('cur')
+    hits[hitIdx].scrollIntoView({ block: 'center' })
+    if (lastResult) setCountText(lastResult)
+  }
+
+  function clearSearch() {
+    clearTimeout(searchTimer)
+    searchSeq++
+    searchDone = null
+    lastResult = null
+    hits = []
+    hitIdx = -1
+    $('logs-q').value = ''
+    $('logs-count').textContent = ''
+    $('logs-results').textContent = ''
+    updateNav()
+    if (logsMode === 'history' && logsId) {
+      setLogsView('tail')
+      request('colima.logs.stop', {}).catch(() => {}) // aborts a running search
+    }
+  }
+
+  async function runSearch() {
+    clearTimeout(searchTimer)
+    const query = $('logs-q').value
+    if (!query || logsMode !== 'history' || !logsId) { if (!query) clearSearch(); return }
+    const id = logsId
+    const epoch = logsEpoch
+    const seq = ++searchSeq
+    const caseSensitive = searchCase
+    $('logs-count').innerHTML = '<span class="spin"></span> Searching…'
+    try {
+      const r = await request('colima.logs.search', { id, query, caseSensitive })
+      if (seq !== searchSeq || logsId !== id || epoch !== logsEpoch) return // superseded
+      if (!r.ok) {
+        if (!r.cancelled) $('logs-count').textContent = r.message || 'Search failed.'
+        return
+      }
+      const box = $('logs-results')
+      box.textContent = ''
+      hits = []
+      hitIdx = -1
+      lastResult = r
+      searchDone = { query, caseSensitive }
+      if (r.lines.length) {
+        const frag = document.createDocumentFragment()
+        for (const line of r.lines) { const el = makeHitLine(line, query, caseSensitive); hits.push(el); frag.appendChild(el) }
+        box.appendChild(frag)
+      } else box.innerHTML = '<div class="msg">No matches.</div>'
+      setLogsView('results')
+      updateNav()
+      if (hits.length) gotoHit(hits.length - 1)
+      else setCountText(r)
+    } catch (err) {
+      if (seq === searchSeq && logsId === id) $('logs-count').textContent = `Search failed: ${err.message}`
+    }
+  }
+
+  async function openContext(ts) {
+    const id = logsId
+    const epoch = logsEpoch
+    resultsScroll = $('logs').scrollTop
+    try {
+      const r = await request('colima.logs.context', { id, ts })
+      if (logsId !== id || epoch !== logsEpoch) return
+      if (!r.ok) { setStatus(`context failed: ${r.message}`); return }
+      const box = $('logs-context')
+      box.textContent = ''
+      const bar = document.createElement('div')
+      bar.id = 'logs-context-bar'
+      bar.innerHTML = '<button id="logs-back">&larr; Back to results</button>'
+      box.appendChild(bar)
+      let focus = null
+      for (const line of r.lines) {
+        const el = makeLine(line)
+        if (el.dataset.ts === ts) { el.classList.add('focus'); focus = focus || el }
+        box.appendChild(el)
+      }
+      setLogsView('context')
+      if (focus) focus.scrollIntoView({ block: 'center' })
+    } catch (err) { if (logsId === id) setStatus(`context failed: ${err.message}`) }
+  }
+
+  function backToResults() {
+    $('logs-context').textContent = ''
+    setLogsView('results')
+    $('logs').scrollTop = resultsScroll
+  }
+
+  document.addEventListener('input', (e) => {
+    if (e.target.id !== 'logs-q') return
+    clearTimeout(searchTimer)
+    searchTimer = setTimeout(runSearch, SEARCH_DEBOUNCE_MS)
+  })
+
+  document.addEventListener('keydown', (e) => {
+    if (e.target.id !== 'logs-q') return
+    if (e.key === 'Escape') { e.preventDefault(); clearSearch(); return }
+    if (e.key !== 'Enter') return
+    e.preventDefault()
+    const q = e.target.value
+    const fresh = !searchDone || searchDone.query !== q || searchDone.caseSensitive !== searchCase
+    if (fresh || logsView !== 'results') runSearch()
+    else gotoHit(hitIdx + (e.shiftKey ? -1 : 1))
+  })
+
+  window.orca.on('colima.logs.chunk', (res) => {
+    if (res && res.id === logsId && logsMode === 'live' && typeof res.text === 'string') appendLogs(res.text)
+  })
+
+  window.orca.on('colima.logs.end', (res) => {
+    if (res && res.id === logsId && logsMode === 'live') setLogsState(false, LOGS_END_LABELS[res.reason] || 'Stopped')
+  })
+
+  // Port chips are role="button": copy on Enter or Space too.
+  document.addEventListener('keydown', (e) => {
+    const chip = e.target.closest && e.target.closest('.port.link')
+    if (!chip || (e.key !== 'Enter' && e.key !== ' ')) return
+    e.preventDefault()
+    copyPort(chip.dataset.copy)
+  })
+
+  document.addEventListener('click', async (e) => {
+    const link = e.target.closest('.port.link')
+    if (link) { await copyPort(link.dataset.copy); return }
+    // (Enter/Space on a focused chip is handled by the keydown listener below.)
+    if (e.target.id === 'logs-close') { closeLogs(); return }
+    if (e.target.id === 'logs-load-older') { await loadOlder(); return }
+    if (e.target.id === 'logs-mode') { await (logsMode === 'live' ? startHistory() : startLive()); return }
+    if (e.target.id === 'logs-case') {
+      searchCase = !searchCase
+      e.target.classList.toggle('on', searchCase)
+      e.target.setAttribute('aria-pressed', String(searchCase))
+      if ($('logs-q').value) runSearch()
+      return
+    }
+    if (e.target.id === 'logs-prev') { gotoHit(hitIdx - 1); return }
+    if (e.target.id === 'logs-next') { gotoHit(hitIdx + 1); return }
+    if (e.target.id === 'logs-back') { backToResults(); return }
+    const hit = e.target.closest('.hit')
+    if (hit && hit.dataset.ts && !String(window.getSelection()).length) { await openContext(hit.dataset.ts); return }
+    const b = e.target.closest('button[data-a]')
+    if (!b) return
+    const { a, t } = b.dataset
+    if (a === 'vm-start') { await startVm(b); return }
+    if (a === 'compose') { await composeAction(t, b.dataset.c); return }
+    b.disabled = true
+    setStatus(`${a}...`)
+    try {
+      if (a === 'logs') await openLogs(t)
+      else {
+        const r = await request(a === 'shell' ? 'colima.shell' : 'colima.action', { id: t, action: a })
+        setStatus(r.ok ? `${a}: done` : `${a} failed: ${r.message}`)
+      }
+    } catch (err) { setStatus(`${a} failed: ${err.message}`) }
+    b.disabled = false
+    busy = false
+    refresh()
+  })
+
+  function clearConfirm() {
+    clearTimeout(confirmTimer)
+    confirmId = null
+    confirmTimer = null
+  }
+
+  async function composeAction(id, action) {
+    if (action === 'down' && confirmId !== id) {
+      clearConfirm()
+      confirmId = id
+      confirmTimer = setTimeout(() => { clearConfirm(); if (state) render() }, CONFIRM_MS)
+      render()
+      return
+    }
+    clearConfirm()
+    delete composeErrors[id]
+    try {
+      const r = await request('colima.compose', { stack: id, action })
+      if (r.ok === false) composeErrors[id] = r.message || 'Compose failed.'
+    } catch (err) { composeErrors[id] = err.message }
+    busy = false
+    refresh()
+  }
+
+  async function startVm(b) {
+    b.disabled = true
+    startError = null
+    try {
+      const r = await request('colima.start', { cpu: size.cpu, memory: size.memory })
+      if (r.error) startError = r.error
+    } catch (err) { startError = err.message }
+    busy = false
+    refresh()
+  }
+
+  document.addEventListener('input', (e) => {
+    if (!size || (e.target.id !== 'size-cpu' && e.target.id !== 'size-mem')) return
+    const n = Number(e.target.value)
+    if (e.target.id === 'size-cpu') size.cpu = n
+    else size.memory = n
+    const btn = document.querySelector('button[data-a="vm-start"]')
+    if (btn) btn.textContent = `Start Colima (${size.cpu} CPU, ${size.memory} GB)`
+  })
+
+  window.orca.on('colima.started', (res) => {
+    startError = res && !res.ok ? (res.error || 'Unknown error') : null
+    busy = false
+    refresh()
+  })
+
+  window.orca.on('colima.compose.done', (res) => {
+    if (res && res.stack) {
+      if (res.ok) delete composeErrors[res.stack]
+      else composeErrors[res.stack] = res.error || 'Compose failed.'
+    }
+    busy = false
+    refresh()
+  })
+
+  function startPolling() {
+    if (timer) return
+    refresh()
+    timer = setInterval(refresh, POLL_MS)
+    statsTimer = setInterval(pollStats, STATS_MS)
+    // The worker drops followers of an idle (hidden) panel: pick the stream up again.
+    if (logsId && logsMode === 'live' && !logsLive) startLive()
+    if (!eventsLive) ctxTimer = setInterval(watchContext, CONTEXT_CHECK_MS)
+  }
+  function stopPolling() { if (logsId) setLogsState(false, "Paused"); clearInterval(timer); clearInterval(ctxTimer); clearInterval(statsTimer); timer = null; ctxTimer = null; statsTimer = null }
+  document.addEventListener('visibilitychange', () => document.hidden ? stopPolling() : startPolling())
+  window.orca.on('colima.refresh', refresh)
+  // Focus or terminal changes arrive as events. Each new subscriber first gets the current context,
+  // so the first event also proves the subscription works; until then (or if it never comes) the
+  // 700ms watcher stays on as a fallback.
+  try {
+    window.orca.on('workspace.changed', () => {
+      if (!eventsLive) { eventsLive = true; clearInterval(ctxTimer); ctxTimer = null }
+      watchContext()
+    })
+  } catch { /* events unavailable: the watcher keeps polling */ }
+  startPolling()
+</script>
+</body>
+</html>
