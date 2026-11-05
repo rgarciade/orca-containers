@@ -31,8 +31,13 @@ const DEFAULT_PREFS = { cpu: 4, memory: 8 }
 const COMPOSE_ACTIONS = {
   up: ['up', '-d'],
   down: ['down'], // never `-v`: volumes are data
-  restart: ['restart']
+  restart: ['restart'],
+  start: ['start'], // start existing containers (no create)
+  stop: ['stop']
 }
+const CONTAINER_ACTIONS = ['start', 'stop', 'restart']
+const CONTAINER_ACTION_TIMEOUT_MS = 120000 // slow containers take a while to stop
+const CONTAINER_ID_RE = /^[0-9a-f]{12,64}$/
 // compose.yaml, docker-compose.yml, docker-compose.dev.yml, compose.override.yaml...
 const COMPOSE_FILE_RE = /^(?:docker-)?compose(?:\.[\w-]+)*\.ya?ml$/
 const PROJECT_RE = /^[a-z0-9][a-z0-9_-]*$/
@@ -48,9 +53,9 @@ const ORCA = findBin('orca', [ORCA_BIN_DIR]) ?? join(ORCA_BIN_DIR, 'orca')
 // colima shells out to limactl/docker, so child processes need the Homebrew dirs on PATH.
 const COLIMA_ENV = { ...process.env, PATH: BIN_DIRS.join(delimiter) }
 
-function run(bin, args) {
+function run(bin, args, timeout = 20000) {
   return new Promise((resolve) => {
-    execFile(bin, args, { cwd: '/', env: { ...process.env, DOCKER_HOST }, maxBuffer: 8 * 1024 * 1024, timeout: 20000 },
+    execFile(bin, args, { cwd: '/', env: { ...process.env, DOCKER_HOST }, maxBuffer: 8 * 1024 * 1024, timeout },
       (error, stdout, stderr) => resolve({ ok: !error, stdout, stderr: stderr || String(error ?? '') }))
   })
 }
@@ -195,8 +200,9 @@ function publicStack(s, worktree) {
 
 // ---- Scopes ----
 // A scope says which containers a handler works on: omitted = the active worktree; { kind: 'worktree', path }
-// = that Orca worktree; { kind: 'compose', workdir } = containers of one compose working directory. The panel
-// is never trusted: both forms are re-validated here against the live data.
+// = that Orca worktree; { kind: 'compose', workdir } = containers of one compose working directory;
+// { kind: 'container', id } = one container WITHOUT compose labels. The panel is never trusted: every
+// form is re-validated here against the live data.
 let listsCache = { at: 0, value: null }
 
 // Pure. The deepest worktree root containing `dir` (nested paths win; /a/b never captures /a/bc), or null.
@@ -245,6 +251,13 @@ export function validateScope(scope, worktrees, containers) {
     const ok = typeof scope.workdir === 'string' && scope.workdir && (containers ?? []).some((c) => c.workdir === scope.workdir)
     return ok ? { kind: 'compose', root: scope.workdir } : { gone: true, error: 'That Compose project no longer has containers.' }
   }
+  if (scope.kind === 'container') {
+    // Only containers outside any Compose project (same rule as the overview's "Individual containers").
+    const hit = typeof scope.id === 'string' && CONTAINER_ID_RE.test(scope.id)
+      ? (containers ?? []).find((c) => c && c.id === scope.id && !c.project && !c.workdir)
+      : null
+    return hit ? { kind: 'container', root: hit.id } : { gone: true, error: 'That container no longer exists or belongs to a Compose project.' }
+  }
   return { gone: true, error: 'Invalid scope.' }
 }
 
@@ -267,6 +280,13 @@ async function loadScope(orca, scope, { fresh = false } = {}) {
     if (v.gone) return { ...v, containers: [] }
     const r = await listContainers()
     return { kind: 'worktree', root: v.root, containers: containersOfWorktree(r.containers, lists.worktrees, v.root), error: r.error, uncertain: Boolean(r.error) }
+  }
+  if (scope.kind === 'container') {
+    const r = await listContainers()
+    if (r.error) return { kind: 'container', root: null, containers: [], error: r.error, uncertain: true }
+    const v = validateScope(scope, [], r.containers)
+    if (v.gone) return { ...v, containers: [] }
+    return { kind: 'container', root: v.root, containers: r.containers.filter((c) => c.id === v.root), error: null }
   }
   const r = await listContainers()
   if (r.error) return { kind: 'compose', root: null, containers: [], error: r.error, uncertain: true }
@@ -294,7 +314,7 @@ export function composeScopeStacks(containers) {
   return [...stacks.values()]
 }
 
-const stacksForScope = async (s) => (s.kind === 'compose' ? composeScopeStacks(s.containers) : discoverStacks(s.root, s.containers))
+const stacksForScope = async (s) => (s.kind === 'container' ? [] : s.kind === 'compose' ? composeScopeStacks(s.containers) : discoverStacks(s.root, s.containers))
 
 async function stateForScope(orca, scope) {
   const s = await loadScope(orca, scope)
@@ -305,23 +325,36 @@ async function stateForScope(orca, scope) {
 }
 
 // Re-discovers server-side so the panel never supplies a path. Returns the internal stack.
+// Pure. Containers of `project` anywhere on the host that the validated scope does not contain: `-p <project>`
+// would act on them too, so such a stack must not be touched from a narrower scope.
+export function containersOutsideScope(project, scopeContainers, allContainers) {
+  const mine = new Set((scopeContainers ?? []).map((c) => c.id))
+  return (allContainers ?? []).filter((c) => c.project === project && !mine.has(c.id))
+}
+
 async function ownedStack(orca, id, scope) {
   const s = await loadScope(orca, scope, { fresh: true })
   if (!s.root) return { error: 'Could not identify the worktree.' }
   if (s.error) return { error: 'Docker is unreachable. Is Colima running?' }
   const stack = (await stacksForScope(s)).find((st) => st.id === id)
-  return stack ? { kind: s.kind, worktree: s.root, stack } : { error: 'Stack is not in the shown scope.' }
+  return stack ? { kind: s.kind, worktree: s.root, stack, scopeContainers: s.containers } : { error: 'Stack is not in the shown scope.' }
 }
 
 async function composeRun(orca, input) {
   const action = input?.action
   if (!Object.hasOwn(COMPOSE_ACTIONS, action)) return { ok: false, message: 'Unknown action.' }
   const id = String(input?.stack ?? '')
-  const { kind, worktree, stack, error } = await ownedStack(orca, id, input?.scope)
+  const { kind, worktree, stack, scopeContainers, error } = await ownedStack(orca, id, input?.scope)
   if (!stack) return { ok: false, message: error }
   if (kind === 'compose' && action === 'up') return { ok: false, message: 'Up is not available for Compose projects outside Orca worktrees.' }
   if (action === 'up' && stack.files.length === 0) return { ok: false, message: 'No compose file known for this stack.' }
-  if ((action === 'down' || action === 'restart') && stack.total === 0) return { ok: false, message: 'Stack has no containers.' }
+  if (action !== 'up' && stack.total === 0) return { ok: false, message: 'Stack has no containers.' }
+  if (stack.project) {
+    const all = await listContainers()
+    if (all.error) return { ok: false, message: 'Docker is unreachable. Is Colima running?' }
+    const outside = containersOutsideScope(stack.project, scopeContainers, all.containers)
+    if (outside.length > 0) return { ok: false, message: `Project ${stack.project} also has ${outside.length} container(s) outside this scope; refusing to act on them.` }
+  }
   const key = opKey(worktree, id)
   if (composeOps.has(key)) return { busy: true }
   composeOps.set(key, action)
@@ -346,7 +379,7 @@ async function ownedContainer(orca, id, scope, fresh = false) {
 // ---- Overview tree ----
 const byRunningThenName = (a, b) => (b.running > 0) - (a.running > 0) || String(a.name).localeCompare(String(b.name))
 const tally = (items) => ({ running: items.filter((c) => c.state === 'running').length, total: items.length })
-const slimContainer = (c) => ({ id: c.id, name: c.name, image: c.image, state: c.state, status: c.status, ports: c.ports })
+const slimContainer = (c) => ({ id: c.id, name: c.name, image: c.image, state: c.state, status: c.status, ports: c.ports, project: c.project })
 const sortContainers = (items) => items.map(slimContainer).sort((a, b) => (b.state === 'running') - (a.state === 'running') || a.name.localeCompare(b.name))
 
 // Pure. Orca project > worktree > containers, then "other" compose projects and individual containers.
@@ -954,8 +987,6 @@ async function statsForScope(orca, scope) {
   return Object.keys(stats).length || !res.stderr ? { ok: true, stats } : { ok: false, message: res.stderr.slice(0, 300) }
 }
 
-const CONTAINER_ID_RE = /^[0-9a-f]{12,64}$/
-
 // POSIX single-quote quoting: safe for any text, including quotes, spaces and $.
 export const shellQuote = (text) => `'${String(text).replaceAll("'", "'\\''")}'`
 
@@ -1021,10 +1052,10 @@ export default async function activate(orca) {
 
   handle('colima.action', async (input) => {
     const action = input?.action
-    if (action !== 'start' && action !== 'stop') return { ok: false, message: 'Unknown action.' }
+    if (!CONTAINER_ACTIONS.includes(action)) return { ok: false, message: 'Unknown action.' }
     const { target } = await ownedContainer(orca, String(input?.id ?? ''), input?.scope, true)
     if (!target) return NOT_OWNED
-    const res = await run(DOCKER, [action, target.id])
+    const res = await run(DOCKER, [action, target.id], CONTAINER_ACTION_TIMEOUT_MS)
     return res.ok ? { ok: true } : { ok: false, message: res.stderr.slice(0, 300) }
   })
 
@@ -1033,6 +1064,7 @@ export default async function activate(orca) {
     if (!target) return NOT_OWNED
     if (kind !== 'worktree') return { ok: false, message: 'A shell needs an Orca worktree: open this container from its worktree.' }
     if (!CONTAINER_ID_RE.test(target.id)) return { ok: false, message: 'Unexpected container id.' }
+    if (target.state !== 'running') return { ok: false, message: 'A shell needs a running container.' }
     const res = await orcaJson(['terminal', 'create', '--worktree', `path:${worktree}`, '--title', `sh ${target.name}`,
       '--command', buildShellCommand(DOCKER, DOCKER_HOST, target.id), '--focus'])
     return res.ok ? { ok: true } : { ok: false, message: `orca CLI failed: ${String(res.error?.message ?? '').slice(0, 200)}` }

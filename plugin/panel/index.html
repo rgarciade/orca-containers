@@ -99,6 +99,20 @@
   .st.running { color: #3fb950; } .st.stopped { color: #f85149; opacity: .6; } .st.other { color: #d29922; }
   .crow .img { font-size: 11px; color: var(--orca-muted-foreground); word-break: break-all; }
   .crow .ports { margin-top: 4px; }
+  .crow-main .more, .tg-head .more { margin-left: 4px; padding: 0 6px; border-color: transparent; background: transparent; line-height: 1.2; opacity: 0; flex: none; }
+  .tg-head .count + .more { margin-left: 0; }
+  .crow-main .more { margin-left: auto; }
+  .tg-head:hover .more, .tg-head:focus-within .more, .crow:hover .more, .crow:focus-within .more, .more:focus-visible, .more[aria-expanded="true"] { opacity: 1; }
+  .op { color: #d29922; font-size: 11px; white-space: nowrap; margin-left: auto; }
+  .op + .count { margin-left: 0; }
+  #ctx-menu { position: fixed; z-index: 1000; min-width: 170px; max-width: calc(100vw - 8px); max-height: calc(100vh - 8px); overflow: auto; box-sizing: border-box; padding: 4px; background: var(--orca-popover, var(--orca-background)); color: var(--orca-foreground); border: 1px solid var(--orca-border); border-radius: 8px; box-shadow: 0 6px 20px rgba(0, 0, 0, .35); }
+  #ctx-menu [role="menuitem"] { display: block; width: 100%; text-align: left; background: transparent; border: none; border-radius: 4px; padding: 5px 10px; color: inherit; cursor: pointer; }
+  #ctx-menu [role="menuitem"]:hover, #ctx-menu [role="menuitem"]:focus { background: rgba(127, 127, 127, .2); outline: none; }
+  #ctx-menu [role="menuitem"]:focus-visible { box-shadow: inset 0 0 0 1px #58a6ff; }
+  #ctx-menu [role="menuitem"][aria-disabled="true"] { opacity: .45; cursor: default; }
+  #ctx-menu [role="menuitem"][aria-disabled="true"]:hover { background: transparent; }
+  #ctx-menu [role="menuitem"].danger { color: #f85149; }
+  #ctx-menu [role="separator"] { height: 1px; margin: 4px 2px; background: var(--orca-border); }
   @keyframes flash { from { background: rgba(88, 166, 255, .35); } to { background: transparent; } }
   .item.flash { animation: flash 1.8s ease-out; }
 </style>
@@ -173,9 +187,17 @@
   let searching = true // no result yet for the focused workspace
   let ctxTimer = null
   let eventsLive = false // workspace.changed has been received: the polling watcher is not needed
-  const OP_LABELS = { up: 'Starting…', down: 'Stopping…', restart: 'Restarting…' }
+  const OP_LABELS = { up: 'Starting…', down: 'Stopping…', restart: 'Restarting…', start: 'Starting…', stop: 'Stopping…' }
+  const GROUP_OP_LABELS = { up: 'Bringing up…', start: 'Starting…', stop: 'Stopping…', restart: 'Restarting…', down: 'Taking down…' }
+  const ROW_OP_LABELS = { start: 'Starting…', stop: 'Stopping…', restart: 'Restarting…', shell: 'Opening shell…' }
+  const OP_STALE_MS = 15 * 60 * 1000 // a done event that never arrived must not leave a spinner forever
+  const groupOps = new Map() // group ctx key -> { action, name, label, pending:Set, errors:[], at }
+  const rowOps = new Map() // container id -> { label, at }
   const VM_OP_LABELS = { starting: 'Starting&hellip;', stopping: 'Stopping&hellip;', restarting: 'Restarting&hellip;' }
   const CONFIRM_MS = 4000
+  const ARM_GUARD_MS = 400 // a confirm cannot fire right after being armed (key repeat, double click)
+  let confirmAt = 0
+  let vmConfirmAt = 0
   let confirmId = null // stack whose Down button is waiting for confirmation
   let confirmTimer = null
   const composeErrors = {} // stack id -> last failure message
@@ -372,7 +394,7 @@
         <div class="row">
           <button data-a="logs" data-t="${esc(c.id)}">logs</button>
           <button data-a="${c.state === 'running' ? 'stop' : 'start'}" data-t="${esc(c.id)}">${c.state === 'running' ? 'stop' : 'start'}</button>
-          <button data-a="shell" data-t="${esc(c.id)}">shell</button>
+          ${pinned && pinned.scope.kind !== 'worktree' ? '' : `<button data-a="shell" data-t="${esc(c.id)}">shell</button>`}
         </div>
       </div>`
   }
@@ -408,15 +430,80 @@
     ? ` role="button" tabindex="0" data-open="${esc(open.kind)}" data-v="${esc(open.v)}" data-n="${esc(open.n)}" data-b="${esc(open.b || '')}"${cid ? ` data-cid="${esc(cid)}"` : ''}`
     : '')
 
-  function treeHead(key, depth, name, sub, counts, open) {
-    const chev = `<span class="chev"${open ? ` data-toggle="${esc(key)}"` : ''}>${isOpen(key) ? '&#9662;' : '&#9656;'}</span>`
-    const attrs = open ? openAttrs(open) : ` role="button" tabindex="0" data-toggle="${esc(key)}" aria-expanded="${isOpen(key)}"`
-    return `<div class="tg-head${open ? ' openable' : ''}" style="--d:${depth}"${attrs}>${chev}<span class="tg-name">${esc(name)}</span>${sub ? `<span class="sub">${esc(sub)}</span>` : ''}<span class="count">${esc(runningText(counts))}</span></div>`
+  // Pure menu rules (no DOM). Each item: { id, label, disabled, danger } or { sep: true }.
+  // <menu-rules>
+  // g = { kind: 'worktree' | 'compose', running, total, projects (count), busy, conflict }
+  // conflict: a Compose project of the group also has containers in another group, and `-p <project>` would hit them too.
+  function groupMenuItems(g) {
+    const none = g.total === 0
+    const noStack = g.projects === 0 || Boolean(g.conflict)
+    const reason = g.conflict ? 'Its Compose project also has containers outside this group' : undefined
+    const items = [{ id: 'details', label: 'Open details' }, { sep: true }]
+    items.push({ id: 'start', label: 'Start', reason, disabled: g.busy || none || noStack || g.running === g.total })
+    items.push({ id: 'stop', label: 'Stop', reason, disabled: g.busy || none || noStack || g.running === 0 })
+    items.push({ id: 'restart', label: 'Restart', reason, disabled: g.busy || none || noStack })
+    if (g.kind === 'worktree') items.push({ id: 'up', label: 'Up', reason, disabled: g.busy || noStack })
+    items.push({ id: 'down', label: 'Down', reason, danger: true, disabled: g.busy || none || noStack })
+    return items
   }
 
-  function treeRow(c, depth, open) {
-    return `<div class="crow${open ? ' openable' : ''}" style="--d:${depth}"${openAttrs(open, open ? c.id : null)}>
-        <div class="crow-main">${stIcon(c.state)}<span class="name">${esc(c.name)}</span><span class="img">${esc(c.image)}</span></div>
+  // c = { state, scopeKind: 'worktree' | 'compose' | 'container', busy }
+  function containerMenuItems(c) {
+    const live = ['running', 'paused', 'restarting'].includes(c.state)
+    const items = [{ id: 'logs', label: 'Logs' }, { sep: true }]
+    items.push(live ? { id: 'stop', label: 'Stop', disabled: c.busy } : { id: 'start', label: 'Start', disabled: c.busy })
+    items.push({ id: 'restart', label: 'Restart', disabled: c.busy })
+    if (c.scopeKind === 'worktree') items.push({ id: 'shell', label: 'Shell', disabled: c.busy || c.state !== 'running' })
+    return items
+  }
+  // </menu-rules>
+
+  // Everything the menu can target, keyed by a stable id: groups `g:w:<path>` / `g:c:<workdir>`, containers `k:<id>`.
+  function buildCtxIndex(o) {
+    const idx = new Map()
+    if (!o) return idx
+    const owners = new Map() // compose project -> number of groups holding its containers
+    const countProjects = (g) => { for (const p of new Set(g.containers.map((c) => c.project).filter(Boolean))) owners.set(p, (owners.get(p) || 0) + 1) }
+    for (const p of o.projects) for (const w of p.worktrees) countProjects(w)
+    for (const g of o.other.projects) countProjects(g)
+    const group = (kind, v, name, sub, g) => {
+      const key = `g:${kind === 'worktree' ? 'w' : 'c'}:${v}`
+      const scope = kind === 'worktree' ? { kind: 'worktree', path: v } : { kind: 'compose', workdir: v }
+      const projects = [...new Set(g.containers.map((c) => c.project).filter(Boolean))]
+      idx.set(key, { type: 'group', key, kind, v, name, sub, scope, label: name, projects, conflict: projects.some((p) => owners.get(p) > 1), running: g.running, total: g.total })
+      for (const c of g.containers) idx.set(`k:${c.id}`, { type: 'container', key: `k:${c.id}`, scopeKind: kind, scope, v, name, sub, c, label: c.name })
+      return key
+    }
+    for (const p of o.projects) for (const w of p.worktrees) group('worktree', w.path, w.name, w.branch, w)
+    for (const g of o.other.projects) if (g.workdir) group('compose', g.workdir, g.name, 'Compose project', g)
+    for (const c of o.individual.containers) {
+      idx.set(`k:${c.id}`, { type: 'container', key: `k:${c.id}`, scopeKind: 'container', scope: { kind: 'container', id: c.id }, v: c.id, name: c.name, sub: 'Container', c, label: c.name })
+    }
+    return idx
+  }
+
+  const resolveCtx = (key) => buildCtxIndex(overview).get(key) || null
+
+  function menuItemsFor(t) {
+    if (t.type === 'group') return groupMenuItems({ kind: t.kind, running: t.running, total: t.total, projects: t.projects.length, busy: groupOps.has(t.key), conflict: t.conflict })
+    return containerMenuItems({ state: t.c.state, scopeKind: t.scopeKind, busy: rowOps.has(t.c.id) })
+  }
+
+  const moreBtn = (ctx, label) => `<button type="button" class="more" data-more="${esc(ctx)}" aria-haspopup="menu" aria-expanded="${Boolean(menu && menu.key === ctx)}" aria-label="Actions for ${esc(label)}">&#8943;</button>`
+  const opHtml = (op) => (op ? `<span class="op"><span class="spin"></span> ${esc(op.label)}</span>` : '')
+
+  function treeHead(key, depth, name, sub, counts, open, ctx) {
+    const chev = `<span class="chev"${open ? ` data-toggle="${esc(key)}"` : ''}>${isOpen(key) ? '&#9662;' : '&#9656;'}</span>`
+    const attrs = (open ? openAttrs(open) : ` role="button" tabindex="0" data-toggle="${esc(key)}" aria-expanded="${isOpen(key)}"`) + (ctx ? ` data-ctx="${esc(ctx)}"` : '')
+    return `<div class="tg-head${open ? ' openable' : ''}" style="--d:${depth}"${attrs}>${chev}<span class="tg-name">${esc(name)}</span>${sub ? `<span class="sub">${esc(sub)}</span>` : ''}${ctx ? opHtml(groupOps.get(ctx)) : ''}<span class="count">${esc(runningText(counts))}</span>${ctx ? moreBtn(ctx, name) : ''}</div>`
+  }
+
+  // ctx = true when the row has a context menu; rows that are not openable still need a tab stop.
+  function treeRow(c, depth, open, ctx) {
+    const ck = `k:${c.id}`
+    const focusable = ctx && !open ? ' tabindex="0"' : ''
+    return `<div class="crow${open ? ' openable' : ''}" style="--d:${depth}"${openAttrs(open, open ? c.id : null)}${focusable}${ctx ? ` data-ctx="${esc(ck)}"` : ''}>
+        <div class="crow-main">${stIcon(c.state)}<span class="name">${esc(c.name)}</span><span class="img">${esc(c.image)}</span>${opHtml(rowOps.get(c.id))}${ctx ? moreBtn(ck, c.name) : ''}</div>
         <div class="sub">${esc(c.status)}</div>
         ${renderPorts(c.ports)}
       </div>`
@@ -429,47 +516,62 @@
       if (!isOpen(`p:${p.id}`)) continue
       for (const w of p.worktrees) {
         const open = { kind: 'worktree', v: w.path, n: w.name, b: w.branch }
-        out.push(treeHead(`w:${w.path}`, 1, w.name, w.branch, w, open))
-        if (isOpen(`w:${w.path}`)) for (const c of w.containers) out.push(treeRow(c, 2, open))
+        out.push(treeHead(`w:${w.path}`, 1, w.name, w.branch, w, open, `g:w:${w.path}`))
+        if (isOpen(`w:${w.path}`)) for (const c of w.containers) out.push(treeRow(c, 2, open, true))
       }
     }
     if (o.other.projects.length) {
       out.push(treeHead('other', 0, 'Other Compose projects', '', o.other))
       if (isOpen('other')) for (const g of o.other.projects) {
         const open = g.workdir ? { kind: 'compose', v: g.workdir, n: g.name, b: 'Compose project' } : null
-        const key = `o:${g.key}`
-        out.push(open ? treeHead(key, 1, g.name, '', g, open) : treeHead(key, 1, g.name, '', g))
-        if (isOpen(key)) for (const c of g.containers) out.push(treeRow(c, 2, open))
+        const key = `o:${encodeURIComponent(g.key)}`
+        out.push(open ? treeHead(key, 1, g.name, '', g, open, `g:c:${g.workdir}`) : treeHead(key, 1, g.name, '', g))
+        if (isOpen(key)) for (const c of g.containers) out.push(treeRow(c, 2, open, Boolean(open)))
       }
     }
     if (o.individual.containers.length) {
       out.push(treeHead('individual', 0, 'Individual containers', '', o.individual))
-      if (isOpen('individual')) for (const c of o.individual.containers) out.push(treeRow(c, 1, null))
+      if (isOpen('individual')) for (const c of o.individual.containers) out.push(treeRow(c, 1, null, true))
     }
     return out.join('')
   }
 
   function renderOverview() {
     const el = $('content')
+    pruneStaleOps()
     if (!overview) { el.innerHTML = '<div class="msg"><span class="spin"></span> Loading containers…</div>'; return }
     const problem = dockerProblemHtml(overview.error)
-    if (problem) { el.innerHTML = problem; return }
+    if (problem) { el.innerHTML = problem; closeMenu(false); return }
     const n = overview.projects.reduce((a, p) => a + p.total, 0) + overview.other.total + overview.individual.total
     const running = overview.projects.reduce((a, p) => a + p.running, 0) + overview.other.running + overview.individual.running
     const title = `<div class="section-title">Containers <span class="count">${running}/${n} running</span></div>`
     const warn = overview.orcaError ? `<div class="msg">${esc(overview.orcaError)} Worktree grouping is unavailable.</div>` : ''
+    const ae = document.activeElement
+    const focusRow = ae && el.contains(ae) && ae.closest ? ae.closest('[data-ctx]') : null
+    const focusKey = focusRow ? focusRow.dataset.ctx : null
+    const focusMore = Boolean(focusKey && ae.classList.contains('more'))
     el.innerHTML = n === 0 ? `${title}${warn}<div class="msg">No containers.</div>` : `${title}${warn}<div class="tree">${renderTree(overview)}</div>`
+    if (focusKey && !menu) {
+      const next = Array.from(el.querySelectorAll('[data-ctx]')).find((x) => x.dataset.ctx === focusKey)
+      const target = next && (focusMore ? next.querySelector('.more') : next)
+      if (target) target.focus({ preventScroll: true })
+    }
+    syncMenu()
   }
 
   // Scrolls to and briefly highlights the container the user clicked in the overview (once per pin).
   function applyFocus() {
     if (!pinned || pinned.focusDone || !state || searching) return
     pinned.focusDone = true
-    if (!pinned.focusId) return
-    const el = Array.from(document.querySelectorAll('.item[data-cid]')).find((x) => x.dataset.cid === pinned.focusId)
-    if (!el) return
-    el.scrollIntoView({ block: 'center' })
-    el.classList.add('flash')
+    const logsFor = pinned.autoLogs
+    pinned.autoLogs = null
+    const el = pinned.focusId ? Array.from(document.querySelectorAll('.item[data-cid]')).find((x) => x.dataset.cid === pinned.focusId) : null
+    if (el) {
+      el.scrollIntoView({ block: 'center' })
+      el.classList.add('flash')
+    }
+    // Opened from the context menu's "Logs": follow that container's logs straight away.
+    if (logsFor && state.containers.some((c) => c.id === logsFor)) openLogs(logsFor)
   }
 
   function render() {
@@ -477,6 +579,7 @@
     renderCompose()
     renderViewBar()
     const el = $('content')
+    if (menu && !overviewMode()) closeMenu(false)
     if (overviewMode()) { renderOverview(); return }
     if (searching || !state) {
       el.innerHTML = `<div class="msg"><span class="spin"></span> ${pinned ? 'Loading containers…' : 'Looking for containers in this worktree…'}</div>`
@@ -493,7 +596,7 @@
     const cs = state.containers
     const running = cs.filter((c) => c.state === 'running').length
     const title = `<div class="section-title">Containers <span class="count">${running}/${cs.length} running</span></div>`
-    if (cs.length === 0) { el.innerHTML = `${title}<div class="msg">No containers for this ${pinned && pinned.scope.kind === 'compose' ? 'Compose project' : 'worktree'}.</div>`; return }
+    if (cs.length === 0) { el.innerHTML = `${title}<div class="msg">No containers for this ${pinned && pinned.scope.kind === 'compose' ? 'Compose project' : pinned && pinned.scope.kind === 'container' ? 'container' : 'worktree'}.</div>`; return }
     const groups = {}
     for (const c of cs) (groups[c.service ? 'Compose services' : 'Standalone'] ||= []).push(c)
     // Group headers only help when both kinds are present.
@@ -568,6 +671,7 @@
 
   // ---- View switching ----
   function resetDetail() {
+    closeMenu(false)
     modeSeq++
     state = null
     shownKey = null
@@ -587,8 +691,8 @@
   }
 
   function openScope(d) {
-    const scope = d.open === 'worktree' ? { kind: 'worktree', path: d.v } : { kind: 'compose', workdir: d.v }
-    pinned = { scope, name: d.n, sub: d.b, focusId: d.cid || null, focusDone: false }
+    const scope = d.open === 'worktree' ? { kind: 'worktree', path: d.v } : d.open === 'container' ? { kind: 'container', id: d.v } : { kind: 'compose', workdir: d.v }
+    pinned = { scope, name: d.n, sub: d.b, focusId: d.cid || null, focusDone: false, autoLogs: d.logs ? d.cid : null }
     resetDetail()
     render()
     refresh()
@@ -1016,6 +1120,15 @@
   })
 
   document.addEventListener('click', async (e) => {
+    const mi = e.target.closest('#ctx-menu [role="menuitem"]')
+    if (mi) { await menuActivate(mi.dataset.mid, e); return }
+    const more = e.target.closest('.more')
+    if (more) {
+      if (menu && menu.key === more.dataset.more) { closeMenu(true); return }
+      const r = more.getBoundingClientRect()
+      openMenu(more.dataset.more, r.left, r.bottom + 2, 'more')
+      return
+    }
     const link = e.target.closest('.port.link')
     if (link) { await copyPort(link.dataset.copy); return }
     // (Enter/Space on a focused chip is handled by the keydown listener below.)
@@ -1071,10 +1184,12 @@
     if (action === 'down' && confirmId !== key) {
       clearConfirm()
       confirmId = key
+      confirmAt = Date.now()
       confirmTimer = setTimeout(() => { clearConfirm(); if (state) render() }, CONFIRM_MS)
       render()
       return
     }
+    if (action === 'down' && Date.now() - confirmAt < ARM_GUARD_MS) return
     clearConfirm()
     delete composeErrors[key]
     try {
@@ -1107,10 +1222,12 @@
     if (vmConfirm !== op) {
       clearVmConfirm()
       vmConfirm = op
+      vmConfirmAt = Date.now()
       vmConfirmTimer = setTimeout(() => { clearVmConfirm(); renderVm() }, CONFIRM_MS)
       renderVm()
       return
     }
+    if (Date.now() - vmConfirmAt < ARM_GUARD_MS) return
     clearVmConfirm()
     vmError = null
     closeLogs() // containers die with the VM
@@ -1149,10 +1266,226 @@
       const key = stackKey(res.stack, res.worktree)
       if (res.ok) delete composeErrors[key]
       else composeErrors[key] = res.error || 'Compose failed.'
+      finishGroupOp(res.stack, res)
     }
     busy = false
     refresh()
   })
+
+  // ---- Context menu (All view) ----
+  let menu = null // { key, el, html, confirm, confirmTimer }
+
+  function pruneStaleOps() {
+    const now = Date.now()
+    for (const [k, op] of groupOps) if (now - op.at > OP_STALE_MS) groupOps.delete(k)
+    for (const [k, op] of rowOps) if (now - op.at > OP_STALE_MS) rowOps.delete(k)
+  }
+
+  function markMenuOpener() {
+    for (const b of document.querySelectorAll('.more')) b.setAttribute('aria-expanded', String(Boolean(menu && b.dataset.more === menu.key)))
+  }
+
+  const enabledItems = () => (menu ? Array.from(menu.el.querySelectorAll('[role="menuitem"]:not([aria-disabled="true"])')) : [])
+
+  // Builds the items; keeps focus on `focusId` (or the first enabled item). Rebuilds only when the markup changed.
+  function renderMenu(t, focusId) {
+    const html = menuItemsFor(t).map((i) => (i.sep ? '<div role="separator"></div>'
+      : `<button type="button" role="menuitem" tabindex="-1" data-mid="${esc(i.id)}"${i.disabled ? ' aria-disabled="true"' : ''}${i.disabled && i.reason ? ` title="${esc(i.reason)}"` : ''}${i.danger ? ' class="danger"' : ''}>${esc(i.id === 'down' && menu.confirm === 'down' ? 'Confirm down?' : i.label)}</button>`)).join('')
+    if (menu.html !== html) {
+      menu.html = html
+      menu.el.innerHTML = html
+    }
+    const items = enabledItems()
+    const target = items.find((x) => x.dataset.mid === focusId) || items[0]
+    if (target && document.activeElement !== target) target.focus({ preventScroll: true })
+  }
+
+  function openMenu(key, x, y, anchor = 'pointer') {
+    const t = resolveCtx(key)
+    if (!t || !overviewMode()) return
+    closeMenu(false)
+    const el = document.createElement('div')
+    el.id = 'ctx-menu'
+    el.setAttribute('role', 'menu')
+    el.setAttribute('aria-label', `Actions for ${t.label}`)
+    menu = { key, el, html: null, confirm: null, confirmTimer: null }
+    document.body.appendChild(el)
+    renderMenu(t)
+    menu.anchor = anchor
+    menu.x = x
+    menu.y = y
+    placeMenu()
+    markMenuOpener()
+  }
+
+  // Positions the menu at its anchor: the pointer spot, or below the ⋯ button / row, re-read after every re-render.
+  function placeMenu() {
+    const el = menu.el
+    let { x, y } = menu
+    if (menu.anchor !== 'pointer') {
+      const row = Array.from(document.querySelectorAll('[data-ctx]')).find((n) => n.dataset.ctx === menu.key)
+      const btn = menu.anchor === 'more' && row ? row.querySelector('.more') : null
+      const r = (btn || row || el).getBoundingClientRect()
+      x = r.left + (btn ? 0 : 12)
+      y = r.bottom + (btn ? 2 : 0)
+    }
+    const w = el.offsetWidth
+    const h = el.offsetHeight
+    el.style.left = `${Math.max(4, Math.min(x, window.innerWidth - w - 4))}px`
+    el.style.top = `${Math.max(4, Math.min(y, window.innerHeight - h - 4))}px`
+  }
+
+  function closeMenu(restoreFocus) {
+    if (!menu) return
+    const key = menu.key
+    clearTimeout(menu.confirmTimer)
+    menu.el.remove()
+    menu = null
+    markMenuOpener()
+    if (restoreFocus) {
+      const row = Array.from(document.querySelectorAll('[data-ctx]')).find((x) => x.dataset.ctx === key)
+      if (row) row.focus({ preventScroll: true })
+    }
+  }
+
+  // After each overview render: drop the menu if its target is gone, otherwise refresh its enabled state.
+  function syncMenu() {
+    if (!menu) return
+    const t = resolveCtx(menu.key)
+    if (!t) { closeMenu(false); return }
+    const active = menu.el.contains(document.activeElement) ? document.activeElement.dataset.mid : undefined
+    renderMenu(t, active)
+    placeMenu()
+    markMenuOpener()
+  }
+
+  async function menuActivate(id, ev) {
+    if (!menu) return
+    const t = resolveCtx(menu.key)
+    if (!t) { closeMenu(false); return }
+    const item = menuItemsFor(t).find((i) => i.id === id)
+    if (!item || item.disabled) return
+    if (id === 'down' && menu.confirm !== 'down') {
+      // Inline confirm: the item turns into "Confirm down?" and needs a second activation within CONFIRM_MS.
+      clearTimeout(menu.confirmTimer)
+      menu.confirm = 'down'
+      menu.armedAt = Date.now()
+      const m = menu
+      m.confirmTimer = setTimeout(() => { if (menu === m) { m.confirm = null; syncMenu() } }, CONFIRM_MS)
+      renderMenu(t, 'down')
+      return
+    }
+    // Same gesture as the arming one (key repeat, double click): not a deliberate second activation.
+    if (id === 'down' && ((ev && (ev.repeat || ev.detail > 1)) || Date.now() - menu.armedAt < ARM_GUARD_MS)) return
+    closeMenu(true)
+    if (t.type === 'group') await groupAction(t, id)
+    else await containerAction(t, id)
+  }
+
+  async function groupAction(t, id) {
+    if (id === 'details') { openScope({ open: t.kind, v: t.v, n: t.name, b: t.sub }); return }
+    const op = { action: id, name: t.name, label: GROUP_OP_LABELS[id] || 'Working…', pending: new Set(), errors: [], at: Date.now() }
+    groupOps.set(t.key, op)
+    if (overviewMode()) renderOverview()
+    setStatus(`${t.name}: ${id}...`)
+    // Every pending key is registered before the first await, so a fast "done" event can never empty the set early.
+    await Promise.all(t.projects.map(async (p) => {
+      const stack = `p:${p}`
+      const sk = stack
+      op.pending.add(sk)
+      try {
+        const r = await request('colima.compose', { stack, action: id, scope: t.scope })
+        if (r.busy) { op.pending.delete(sk); op.errors.push(`${p}: another operation is already running`) }
+        else if (r.ok === false) { op.pending.delete(sk); op.errors.push(`${p}: ${r.message || 'failed'}`) }
+      } catch (err) { op.pending.delete(sk); op.errors.push(`${p}: ${err.message}`) }
+    }))
+    settleGroupOp(t.key, op)
+    busy = false
+    refresh()
+  }
+
+  // Ends a group operation once nothing is pending; reports failures in the status line.
+  function settleGroupOp(key, op) {
+    if (op.pending.size > 0 || groupOps.get(key) !== op) return
+    groupOps.delete(key)
+    if (op.errors.length) setStatus(`${op.name}: ${op.action} failed: ${op.errors.join('; ')}`.slice(0, 600), 12000)
+    else setStatus(`${op.name}: ${op.action} done`, 3000)
+    if (overviewMode()) renderOverview()
+  }
+
+  // A compose operation finished. Matched by stack id only: groups never share a project (the menu is disabled
+  // otherwise), and it does not depend on the worker echoing the scope path byte for byte.
+  function finishGroupOp(stackId, res) {
+    for (const [key, op] of [...groupOps]) {
+      if (!op.pending.delete(stackId)) continue
+      if (!res.ok) op.errors.push(res.error || 'failed')
+      settleGroupOp(key, op)
+    }
+  }
+
+  async function containerAction(t, id) {
+    const c = t.c
+    if (id === 'logs') { openScope({ open: t.scopeKind, v: t.v, n: t.name, b: t.sub, cid: c.id, logs: true }); return }
+    rowOps.set(c.id, { label: ROW_OP_LABELS[id] || 'Working…', at: Date.now() })
+    if (overviewMode()) renderOverview()
+    try {
+      const r = await request(id === 'shell' ? 'colima.shell' : 'colima.action', { id: c.id, action: id, scope: t.scope })
+      setStatus(r.ok ? `${c.name}: ${id} done` : `${c.name}: ${id} failed: ${r.message}`, r.ok ? 3000 : 10000)
+    } catch (err) { setStatus(`${c.name}: ${id} failed: ${err.message}`, 10000) }
+    rowOps.delete(c.id)
+    busy = false
+    refresh()
+  }
+
+  function menuKeyTarget(e) {
+    return e.target.closest && e.target.closest('[data-ctx]')
+  }
+
+  document.addEventListener('contextmenu', (e) => {
+    if (menu && menu.el.contains(e.target)) { e.preventDefault(); return }
+    const el = overviewMode() && menuKeyTarget(e)
+    if (!el) return
+    e.preventDefault()
+    // A keyboard-triggered contextmenu has no pointer position: anchor it to the element.
+    if (e.clientX === 0 && e.clientY === 0) { const r = el.getBoundingClientRect(); openMenu(el.dataset.ctx, r.left + 12, r.bottom, 'row'); return }
+    openMenu(el.dataset.ctx, e.clientX, e.clientY)
+  })
+
+  document.addEventListener('keydown', (e) => {
+    if (menu) {
+      const items = enabledItems()
+      const i = items.indexOf(document.activeElement)
+      const go = (n) => { e.preventDefault(); if (items.length) items[(n + items.length) % items.length].focus({ preventScroll: true }) }
+      if (e.key === 'ArrowDown') go(i + 1)
+      else if (e.key === 'ArrowUp') go(i < 0 ? items.length - 1 : i - 1)
+      else if (e.key === 'Home') go(0)
+      else if (e.key === 'End') go(items.length - 1)
+      else if (e.key === 'Escape') { e.preventDefault(); closeMenu(true) }
+      else if (e.key === 'Tab' || e.key === 'PageUp' || e.key === 'PageDown') { closeMenu(false) }
+      return
+    }
+    if (e.key !== 'ContextMenu' && !(e.key === 'F10' && e.shiftKey)) return
+    const el = overviewMode() && menuKeyTarget(e)
+    if (!el) return
+    e.preventDefault()
+    const anchor = e.target.closest('.more') || el
+    const r = anchor.getBoundingClientRect()
+    openMenu(el.dataset.ctx, r.left + (anchor === el ? 12 : 0), r.bottom + 2, anchor === el ? 'row' : 'more')
+  }, true)
+
+  // Outside click, scroll, resize or losing the window close the menu. The ⋯ button toggles it itself.
+  document.addEventListener('mousedown', (e) => {
+    if (!menu || menu.el.contains(e.target)) return
+    const opener = e.target.closest && e.target.closest('.more')
+    if (opener && opener.dataset.more === menu.key) return
+    closeMenu(false)
+  }, true)
+  // Only user scrolling closes it (re-renders also fire scroll events, which must not).
+  const closeOnUserScroll = (e) => { if (menu && !menu.el.contains(e.target)) closeMenu(false) }
+  window.addEventListener('wheel', closeOnUserScroll, { capture: true, passive: true })
+  window.addEventListener('touchmove', closeOnUserScroll, { capture: true, passive: true })
+  window.addEventListener('resize', () => closeMenu(false))
+  window.addEventListener('blur', () => closeMenu(false))
 
   function startPolling() {
     if (timer) return
