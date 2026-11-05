@@ -3,19 +3,19 @@
   "execution": "trusted-worker",
   "id": "colima",
   "publisher": "local",
-  "name": "Colima",
+  "name": "Containers",
   "version": "0.1.0",
-  "description": "Manage the Colima VM and the Docker Compose stacks, containers, ports and logs of the active worktree from Orca's right sidebar.",
+  "description": "Manage your Docker engine (Colima, Docker Desktop, OrbStack, Podman, Rancher Desktop or any Docker context) and the Compose stacks, containers, ports and logs of the active worktree from Orca's right sidebar.",
   "license": "MIT",
   "engines": { "orca": ">=1.4.246" },
   "pluginApi": 1,
   "main": "worker.mjs",
   "contributes": {
     "panels": [
-      { "id": "colima", "title": "Colima", "icon": "package", "entry": "panel/index.html" }
+      { "id": "colima", "title": "Containers", "icon": "package", "entry": "panel/index.html" }
     ],
     "commands": [
-      { "id": "colima.refresh", "title": "Colima: refresh" }
+      { "id": "colima.refresh", "title": "Containers: refresh" }
     ]
   },
   "capabilities": [{ "kind": "notifications:show" }, { "kind": "workspace:read" }, { "kind": "storage:own" }]

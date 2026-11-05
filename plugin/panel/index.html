@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Colima</title>
+<title>Containers</title>
 <style>
   body { font: 12px/1.4 -apple-system, sans-serif; background: var(--orca-background); color: var(--orca-foreground); margin: 0; padding: 10px; }
   h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; margin: var(--space-m) 0 0; color: var(--orca-muted-foreground); }
@@ -31,6 +31,8 @@
   .list .item { padding: var(--space-m) 12px 12px; }
   .list .item:last-child { border-bottom: none; }
   .vm-line { font-weight: 600; margin-bottom: 4px; }
+  .engine-name { font-size: 15px; font-weight: 700; margin: 0 0 var(--space-s); word-break: break-all; }
+  #engine-sel { font: inherit; width: 100%; box-sizing: border-box; margin-bottom: var(--space-s); background: var(--orca-card); color: var(--orca-foreground); border: 1px solid var(--orca-border); border-radius: 4px; padding: 3px 6px; }
   .ports { display: flex; flex-wrap: wrap; gap: var(--space-s); margin-top: var(--space-s); }
   .port { font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; border: 1px solid var(--orca-border); border-radius: 10px; padding: 1px 8px; background: var(--orca-card); }
   .port b { color: #58a6ff; font-weight: 600; }
@@ -180,6 +182,8 @@
   let followSeq = 0 // ordering token for logs.follow / logs.stop, so a late follow cannot outlive a stop
   const overviewMode = () => view === 'all' && !pinned
   const followsWorkspace = () => view === 'worktree' && !pinned
+  let engineName = null // Docker context the panel is showing; null until the first answer
+  let switching = false // an engine change is in flight: polling waits
   let vmError = null // { title, text } of the last failed VM operation
   let vmConfirm = null // 'stop' | 'restart' while that VM button waits for confirmation
   let vmConfirmTimer = null
@@ -213,7 +217,12 @@
     if (pinned && SCOPED.has(name)) input = { ...input, scope: pinned.scope }
     if (name === 'colima.logs.follow' || name === 'colima.logs.stop') input = { ...input, token: ++followSeq }
     const res = await window.orca.host.call('plugin.request', { name, input, timeoutMs: 30000 })
-    return res.output
+    const out = res.output
+    // Answers are tagged with the engine they were produced for; one for another engine than the selected one is dropped.
+    if (out && out.engineName !== undefined && engineName !== null && out.engineName !== engineName) {
+      return { stale: true, ok: false, cancelled: true, message: '', error: null }
+    }
+    return out
   }
 
   let statusTimer = null
@@ -328,35 +337,50 @@
   const options = (values, selected, unit = '') =>
     values.map((n) => `<option value="${n}"${n === selected ? ' selected' : ''}>${n}${unit}</option>`).join('')
 
+  const startLabel = () => `Start ${vm.engine.label}${vm.controls.size && size ? ` (${size.cpu} CPU, ${size.memory} GB)` : ''}`
+
+  function engineSelect() {
+    const list = vm.engines || []
+    if (list.length < 2) return ''
+    const opts = list.map((e) => {
+      const text = `${e.label}${e.label.includes(e.name) ? '' : ` · ${e.name}`}${e.missing ? ' (missing)' : e.reachable === false ? ' (not running)' : ''}`
+      return `<option value="${esc(e.name)}"${e.current ? ' selected' : ''}>${esc(text)}</option>`
+    }).join('')
+    return `<select id="engine-sel" aria-label="Engine (Docker context)">${opts}</select>`
+  }
+
   function renderVm() {
     const el = $('vm')
     if (!vm) { el.innerHTML = ''; return }
     if (!size) size = { ...vm.prefs }
     // Polling must not rebuild the selectors while the user has one open.
     if (el.contains(document.activeElement) && document.activeElement.tagName === 'SELECT') return
+    const ctl = vm.controls
     const dockerDown = Boolean(state && state.error)
     let cls = vm.running ? 'running' : 'stopped'
     let label = vm.running ? 'running' : 'stopped'
     const vmBusy = vm.op || (vm.starting ? 'starting' : null)
     if (vmBusy) { cls = 'starting'; label = vmBusy }
-    const specs = vm.running
-      ? `<div class="sub">${esc(vm.cpu)} CPU &middot; ${esc(gb(vm.memory))} RAM &middot; ${esc(gb(vm.disk))} disk${vm.runtime ? ' &middot; ' + esc(vm.runtime) : ''}${vm.arch ? ' &middot; ' + esc(vm.arch) : ''}</div>`
-      : ''
-    const missing = vm.installed === false ? '<div class="sub">colima binary not found.</div>' : ''
-    const canStart = vm.installed !== false && (!vm.running || dockerDown)
+    const bits = vm.running
+      ? [vm.cpu ? `${vm.cpu} CPU` : '', vm.memory ? `${gb(vm.memory)} RAM` : '', vm.disk ? `${gb(vm.disk)} disk` : '', vm.runtime, vm.arch, vm.version ? `Docker ${vm.version}` : ''].filter(Boolean)
+      : []
+    const specs = bits.length ? `<div class="sub">${bits.map(esc).join(' &middot; ')}</div>` : ''
+    const missing = vm.installed === false ? `<div class="sub">${esc(ctl.missing || 'Engine tools not found.')}</div>` : ''
+    const canStart = vm.installed !== false && ctl.start && (!vm.running || dockerDown)
     const confirming = vmConfirm
-    const vmButtons = vm.running && vm.installed !== false
-      ? `<div class="row"><button data-a="vm-op" data-c="restart">${confirming === 'restart' ? 'Confirm restart?' : 'Restart'}</button><button class="danger" data-a="vm-op" data-c="stop">${confirming === 'stop' ? 'Confirm stop?' : 'Stop'}</button></div>`
+    const vmButtons = vm.running && vm.installed !== false && (ctl.restart || ctl.stop)
+      ? `<div class="row">${ctl.restart ? `<button data-a="vm-op" data-c="restart">${confirming === 'restart' ? 'Confirm restart?' : 'Restart'}</button>` : ''}${ctl.stop ? `<button class="danger" data-a="vm-op" data-c="stop">${confirming === 'stop' ? 'Confirm stop?' : 'Stop'}</button>` : ''}</div>`
       : ''
-    const btn = vmBusy
-      ? `<div class="row"><button disabled><span class="spin"></span> ${VM_OP_LABELS[vmBusy]}</button></div>`
-      : (canStart ? `<div class="size">
+    const sizeSel = ctl.size ? `<div class="size">
           <label>CPU <select id="size-cpu">${options(cpuChoices(vm.limits.maxCpu), size.cpu)}</select></label>
           <label>RAM <select id="size-mem">${options(memChoices(vm.limits.maxMemory, size.memory), size.memory, ' GB')}</select></label>
-        </div>
-        <div class="row"><button data-a="vm-start">Start Colima (${esc(size.cpu)} CPU, ${esc(size.memory)} GB)</button></div>` : '') + vmButtons
-    const err = vmError ? `<div class="err" style="margin-top:6px">${esc(vmError.title)} failed: <span class="sub">${esc(vmError.text)}</span></div>` : ''
-    el.innerHTML = `<div class="card-title">Colima VM</div><div class="vm-line"><span class="${cls}">&#9679;</span> ${label[0].toUpperCase() + label.slice(1)}</div>${specs}${missing}${btn}${err}`
+        </div>` : ''
+    const btn = vmBusy
+      ? `<div class="row"><button disabled><span class="spin"></span> ${VM_OP_LABELS[vmBusy]}</button></div>`
+      : (canStart ? `${sizeSel}<div class="row"><button data-a="vm-start">${esc(startLabel())}</button></div>` : '') + vmButtons
+    const gone = vm.engine.missing ? `<div class="err" style="margin-top:6px">The engine context <b>${esc(vm.engine.name)}</b> no longer exists. Select another engine to continue.</div>` : ''
+    const err = gone + (vmError ? `<div class="err" style="margin-top:6px">${esc(vmError.title)} failed: <span class="sub">${esc(vmError.text)}</span></div>` : '')
+    el.innerHTML = `<div class="card-title">Engine</div><div class="engine-name">${esc(vm.engine.label)}</div>${engineSelect()}<div class="vm-line"><span class="${cls}">&#9679;</span> ${label[0].toUpperCase() + label.slice(1)}</div>${specs}${missing}${btn}${err}`
   }
 
   // Compose errors and the Down confirmation are per scope root + stack id, so they never leak across scopes.
@@ -404,12 +428,15 @@
   // Message for a Docker/VM problem shared by both views; null when there is none.
   function dockerProblemHtml(err) {
     if (!err) return null
-    if (vm && (!vm.running || vm.op || vm.starting)) {
-      // The VM header already says it is stopped; the raw socket error adds nothing.
-      const waiting = { starting: 'Waiting for Colima to start…', stopping: 'Waiting for Colima to stop…', restarting: 'Waiting for Colima to restart…' }
-      return `<div class="msg">${waiting[vm.op || (vm.starting ? 'starting' : '')] || 'Start Colima to see containers.'}</div>`
+    const name = vm && vm.engine ? vm.engine.label : 'the engine'
+    if (vm && vm.engine && vm.engine.missing) return `<div class="msg">Select another engine to see containers.</div>`
+    if (vm && (vm.op || vm.starting)) {
+      const waiting = { starting: `Waiting for ${name} to start…`, stopping: `Waiting for ${name} to stop…`, restarting: `Waiting for ${name} to restart…` }
+      return `<div class="msg">${esc(waiting[vm.op || 'starting'])}</div>`
     }
-    return `<div class="err"><b>Docker is unreachable.</b> Is Colima running?<br><span class="sub">${esc(err)}</span></div>`
+    // The engine card already says it is stopped and offers Start; the raw socket error adds nothing.
+    if (vm && !vm.running && vm.controls.start && vm.installed !== false) return `<div class="msg">Start ${esc(name)} to see containers.</div>`
+    return `<div class="err"><b>Docker is unreachable.</b> Is ${esc(name)} running?<br><span class="sub">${esc(err)}</span></div>`
   }
 
   function renderViewBar() {
@@ -629,16 +656,27 @@
   }
 
   // "All" view: one overview call (+ the VM); no stats.
+  // True when a poll answer must be dropped: it is stale, or its parts belong to different engines. The engine
+  // reported by the VM call becomes the panel's engine (it also picks up a change made from elsewhere).
+  function adoptEngine(nextVm, other) {
+    if (nextVm.stale || other.stale) { engineName = null; return true }
+    const name = nextVm.engine && nextVm.engine.name
+    if (other.engineName !== undefined && other.engineName !== name) { engineName = null; return true }
+    if (name !== undefined) engineName = name
+    return false
+  }
+
   async function refreshOverview(seq) {
     const [nextOverview, nextVm] = await Promise.all([request('colima.overview', {}), request('colima.vm', {})])
     if (seq !== modeSeq) return
+    if (adoptEngine(nextVm, nextOverview)) return
     vm = nextVm
     overview = nextOverview
     render()
   }
 
   async function refresh() {
-    if (busy) return
+    if (busy || switching) return
     busy = true
     const seq = modeSeq
     try {
@@ -647,6 +685,7 @@
       if (key !== shownKey && !searching) { searching = true; resetForWorkspaceSwitch(); render() }
       const [nextState, nextVm] = await Promise.all([request('colima.state', {}), request('colima.vm', {})])
       if (seq !== modeSeq) return
+      if (adoptEngine(nextVm, nextState)) return
       vm = nextVm
       // The VM is going down: nothing to follow or search any more.
       if ((vm.op === 'stopping' || vm.op === 'restarting') && logsId) closeLogs()
@@ -1250,7 +1289,34 @@
     if (e.target.id === 'size-cpu') size.cpu = n
     else size.memory = n
     const btn = document.querySelector('button[data-a="vm-start"]')
-    if (btn) btn.textContent = `Start Colima (${size.cpu} CPU, ${size.memory} GB)`
+    if (btn && vm) btn.textContent = startLabel()
+  })
+
+  // Engine selector: switch the Docker context, drop everything bound to the old engine and reload.
+  document.addEventListener('change', async (e) => {
+    if (e.target.id !== 'engine-sel') return
+    const name = e.target.value
+    e.target.blur()
+    switching = true
+    engineName = name // answers for the previous engine are dropped from now on
+    clearVmConfirm()
+    vmError = null
+    pinned = null
+    overview = null
+    vm = null
+    groupOps.clear()
+    rowOps.clear()
+    resetDetail() // closes logs, drops state and cancels in-flight refreshes
+    render()
+    try {
+      const r = await request('engine.set', { name })
+      if (!r.ok) { engineName = null; setStatus(`Engine change failed: ${r.message}`, 8000) }
+    } catch (err) { engineName = null; setStatus(`Engine change failed: ${err.message}`, 8000) }
+    // A poll that started before the change may still be in flight: invalidate it and start a fresh one.
+    switching = false
+    modeSeq++
+    busy = false
+    refresh()
   })
 
   window.orca.plugin.on('colima.started', (res) => {

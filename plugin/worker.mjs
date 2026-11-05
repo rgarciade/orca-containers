@@ -1,11 +1,12 @@
-// Colima panel worker. The panel polls `colima.state`; all process execution happens here.
+// Containers panel worker (manifest id stays `colima`, so handler and event names keep that prefix).
+// The panel polls `colima.state`; all process execution happens here.
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { execFile, spawn } from 'node:child_process'
 import { existsSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { readdir } from 'node:fs/promises'
 import { cpus, homedir, totalmem, tmpdir } from 'node:os'
 import { basename, delimiter, join, relative, resolve } from 'node:path'
 
-const DOCKER_HOST = `unix://${homedir()}/.colima/default/docker.sock`
 const LOG_TAIL_LINES = 200
 const LOG_OLDER_LINES = 500
 const SEARCH_MAX_RESULTS = 1000
@@ -24,6 +25,7 @@ const ORCA_BIN_DIR = '/Applications/Orca.app/Contents/Resources/bin'
 const WORKTREE_AMBIGUITY_TTL_MS = 5000 // an unresolved lookup is retried at most this often
 const GIB = 1024 ** 3
 const PREFS_KEY = 'vm-prefs'
+const ENGINE_KEY = 'engine' // name of the chosen Docker context
 const VIEW_KEY = 'view'
 const VIEWS = ['worktree', 'all']
 const ORCA_LISTS_TTL_MS = 10000 // `orca worktree list` / `repo list` are cached this long for the 3s polls
@@ -47,15 +49,167 @@ const BIN_DIRS = [...new Set([...(process.env.PATH ?? '').split(delimiter).filte
 const findBin = (name, extraDirs = []) =>
   [...BIN_DIRS, ...extraDirs].map((d) => join(d, name)).find((p) => existsSync(p)) ?? null
 const COLIMA = findBin('colima')
+const ORB = findBin('orb', [join(homedir(), '.orbstack', 'bin')])
+const PODMAN = findBin('podman')
+const RDCTL = findBin('rdctl', [join(homedir(), '.rd', 'bin')])
+const DESKTOP_APP = '/Applications/Docker.app'
+// `docker desktop ...` is a CLI plugin (binary `docker-desktop`); Docker Desktop ships it inside the app.
+const DESKTOP_PLUGIN = findBin('docker-desktop', [
+  join(homedir(), '.docker', 'cli-plugins'), `${DESKTOP_APP}/Contents/Resources/cli-plugins`, '/usr/local/lib/docker/cli-plugins'
+])
 // Last-resort names keep error messages meaningful (ENOENT) when a binary is not installed.
 const DOCKER = findBin('docker') ?? join(EXTRA_BIN_DIRS[0], 'docker')
 const ORCA = findBin('orca', [ORCA_BIN_DIR]) ?? join(ORCA_BIN_DIR, 'orca')
 // colima shells out to limactl/docker, so child processes need the Homebrew dirs on PATH.
-const COLIMA_ENV = { ...process.env, PATH: BIN_DIRS.join(delimiter) }
+// An inherited DOCKER_HOST is dropped: it overrides Docker contexts and would silently pick another engine.
+const CHILD_ENV = (() => {
+  const env = { ...process.env, PATH: BIN_DIRS.join(delimiter) }
+  delete env.DOCKER_HOST
+  return env
+})()
+
+// ---- Engines (Docker contexts) ----
+// The engine is a Docker context. Every docker call targets it with the global `--context <name>` flag
+// (which beats DOCKER_HOST/DOCKER_CONTEXT). Names always come from the listed contexts, never from the panel.
+let activeContext = null // name of the chosen context; null until resolved (docker then uses its own current one)
+let activeSnapshot = null // last known entry of the chosen context (keeps its adapter when the context vanishes)
+let contextMissing = false // the chosen context is no longer listed: nothing runs until the user picks another
+let contexts = [] // last successful `docker context ls`: [{ name, endpoint, current, description, error }]
+let contextsOk = false // a context list has been read at least once
+let contextsAt = 0
+let contextsInflight = null
+let enginePromise = null
+const CONTEXTS_TTL_MS = 10000
+
+// Each request captures the engine once (before any ownership check); every docker command of that request is
+// built through dockerArgs, which re-checks that the engine is still the one the request started with.
+const engineScope = new AsyncLocalStorage()
+export class EngineError extends Error {}
+export function guardEngine(captured, active, missing) {
+  if (missing) return `The engine context ${active ? `"${active}" ` : ''}no longer exists. Select another engine.`
+  if (captured !== undefined && captured !== active) return 'The engine changed while this request was running.'
+  return null
+}
+function dockerArgs(args) {
+  const scope = engineScope.getStore()
+  const problem = guardEngine(scope ? scope.engine : undefined, activeContext, contextMissing)
+  if (problem) throw new EngineError(problem)
+  return activeContext ? ['--context', activeContext, ...args] : args
+}
+
+// Pure. Resolves the saved choice against a successfully read context list.
+// A saved context that is gone is kept (missing: true): another engine is never picked silently.
+export function chooseEngine(saved, list) {
+  if (typeof saved === 'string' && saved) {
+    return validateContext(saved, list) ? { name: saved, missing: false } : { name: saved, missing: true }
+  }
+  const current = (list ?? []).find((c) => c.current)
+  return current ? { name: current.name, missing: false } : { name: null, missing: false, probe: true }
+}
+
+// Pure. `docker context ls --format '{{json .}}'` output (one JSON object per line) -> context entries.
+export function parseContexts(text) {
+  const out = []
+  for (const line of String(text ?? '').split('\n')) {
+    if (!line.trim()) continue
+    try {
+      const c = JSON.parse(line)
+      if (typeof c?.Name !== 'string' || !c.Name) continue
+      out.push({ name: c.Name, endpoint: String(c.DockerEndpoint ?? ''), current: c.Current === true, description: String(c.Description ?? ''), error: String(c.Error ?? '') })
+    } catch { /* skip a malformed line */ }
+  }
+  return out
+}
+
+// Pure. The listed context called `name`, or null: the only way a name reaches a docker command line.
+export const validateContext = (name, list) => (typeof name === 'string' ? (list ?? []).find((c) => c.name === name) ?? null : null)
+
+const PROFILE_RE = /^[A-Za-z0-9][\w.-]*$/
+
+// Pure. Which engine a context belongs to, from its name and endpoint: { kind, label, profile?, machine? }.
+export function detectAdapter(ctx) {
+  const name = String(ctx?.name ?? '')
+  const endpoint = String(ctx?.endpoint ?? '').replace(/^unix:\/\//, '')
+  const lower = `${name} ${endpoint}`.toLowerCase()
+  const colima = /\/\.?colima\/([^/]+)\/docker\.sock$/.exec(endpoint)
+  if (colima || name === 'colima' || name.startsWith('colima-')) {
+    const profile = colima ? colima[1] : name === 'colima' ? 'default' : name.slice('colima-'.length)
+    if (PROFILE_RE.test(profile)) return { kind: 'colima', profile, label: profile === 'default' ? 'Colima' : `Colima (${profile})` }
+  }
+  if (name === 'orbstack' || endpoint.includes('/.orbstack/run/docker.sock')) return { kind: 'orbstack', label: 'OrbStack' }
+  if (name === 'rancher-desktop' || endpoint.endsWith('/.rd/docker.sock')) return { kind: 'rancher', label: 'Rancher Desktop' }
+  if (name === 'desktop-linux' || name === 'desktop-windows' || endpoint.endsWith('/.docker/run/docker.sock') || endpoint.endsWith('/.docker/desktop/docker.sock')) {
+    return { kind: 'desktop', label: 'Docker Desktop' }
+  }
+  if (lower.includes('podman')) {
+    const m = /(podman-machine-[\w.-]*?)(?:-api)?\.sock$/.exec(endpoint)
+    return { kind: 'podman', label: 'Podman', machine: m && PROFILE_RE.test(m[1]) ? m[1] : null }
+  }
+  return { kind: 'generic', label: `Docker (context ${name})` }
+}
+
+const activeEntry = () => validateContext(activeContext, contexts)
+const activeAdapter = () => detectAdapter(activeEntry() ?? activeSnapshot ?? { name: activeContext ?? 'default', endpoint: '' })
+
+// Cached for CONTEXTS_TTL_MS. A failed or timed-out listing keeps the previous list (and is not retried until
+// the TTL passes); `force` skips the cache.
+async function loadContexts(force = false) {
+  if (!force && Date.now() - contextsAt < CONTEXTS_TTL_MS) return contexts
+  contextsInflight ??= (async () => {
+    const res = await run(DOCKER, ['context', 'ls', '--format', '{{json .}}'], 8000)
+    if (res.ok) { contexts = parseContexts(res.stdout); contextsOk = true }
+    contextsAt = Date.now()
+    syncMissing()
+    return contexts
+  })().finally(() => { contextsInflight = null })
+  return contextsInflight
+}
+
+// After a successful listing: is the chosen context still there?
+function syncMissing() {
+  if (!activeContext || !contextsOk || contexts.length === 0) return
+  const entry = activeEntry()
+  contextMissing = !entry
+  if (entry) activeSnapshot = entry
+}
+
+async function firstReachable(list) {
+  for (const c of list) {
+    const res = await run(DOCKER, ['--context', c.name, 'version', '--format', '{{.Server.Version}}'], 5000)
+    if (res.ok) return c
+  }
+  return null
+}
+
+// Saved choice if it still exists, else the docker CLI's current context, else the first reachable, else the first.
+async function pickEngine(orca) {
+  let saved = null
+  try { saved = (await orca.host.call('storage.get', { key: ENGINE_KEY })).value } catch { /* no saved choice */ }
+  if (!contextsOk || contexts.length === 0) { activeContext = typeof saved === 'string' && saved ? saved : null; contextMissing = false; return }
+  const pick = chooseEngine(saved, contexts)
+  if (pick.probe) pick.name = (await firstReachable(contexts) ?? contexts[0]).name
+  activeContext = pick.name
+  contextMissing = pick.missing
+  activeSnapshot = validateContext(activeContext, contexts)
+}
+
+function ensureEngine(orca) {
+  enginePromise ??= (async () => { await loadContexts(); await pickEngine(orca) })().catch(() => {})
+  return enginePromise
+}
+
+// A unix socket that does not exist means the engine is not running; other endpoints are unknown (null).
+const endpointReachable = (endpoint) => (endpoint.startsWith('unix://') ? existsSync(endpoint.slice('unix://'.length)) : null)
+
+const engineList = () => {
+  const list = contexts.map((c) => ({ name: c.name, label: detectAdapter(c).label, current: c.name === activeContext, reachable: endpointReachable(c.endpoint) }))
+  if (contextMissing && activeContext) list.unshift({ name: activeContext, label: activeAdapter().label, current: true, reachable: false, missing: true })
+  return list
+}
 
 function run(bin, args, timeout = 20000) {
   return new Promise((resolve) => {
-    execFile(bin, args, { cwd: '/', env: { ...process.env, DOCKER_HOST }, maxBuffer: 8 * 1024 * 1024, timeout },
+    execFile(bin, args, { cwd: '/', env: CHILD_ENV, maxBuffer: 8 * 1024 * 1024, timeout },
       (error, stdout, stderr) => resolve({ ok: !error, stdout, stderr: stderr || String(error ?? '') }))
   })
 }
@@ -137,7 +291,7 @@ function parseLabels(text) {
 }
 
 async function listContainers() {
-  const res = await run(DOCKER, ['ps', '-a', '--format', '{{json .}}'])
+  const res = await run(DOCKER, dockerArgs(['ps', '-a', '--format', '{{json .}}']))
   if (!res.ok) return { error: res.stderr.slice(0, 500), containers: [] }
   const containers = res.stdout.trim().split('\n').filter(Boolean).map((line) => {
     const c = JSON.parse(line)
@@ -335,7 +489,7 @@ export function containersOutsideScope(project, scopeContainers, allContainers) 
 async function ownedStack(orca, id, scope) {
   const s = await loadScope(orca, scope, { fresh: true })
   if (!s.root) return { error: 'Could not identify the worktree.' }
-  if (s.error) return { error: 'Docker is unreachable. Is Colima running?' }
+  if (s.error) return { error: 'Docker is unreachable. Is the engine running?' }
   const stack = (await stacksForScope(s)).find((st) => st.id === id)
   return stack ? { kind: s.kind, worktree: s.root, stack, scopeContainers: s.containers } : { error: 'Stack is not in the shown scope.' }
 }
@@ -351,16 +505,16 @@ async function composeRun(orca, input) {
   if (action !== 'up' && stack.total === 0) return { ok: false, message: 'Stack has no containers.' }
   if (stack.project) {
     const all = await listContainers()
-    if (all.error) return { ok: false, message: 'Docker is unreachable. Is Colima running?' }
+    if (all.error) return { ok: false, message: 'Docker is unreachable. Is the engine running?' }
     const outside = containersOutsideScope(stack.project, scopeContainers, all.containers)
     if (outside.length > 0) return { ok: false, message: `Project ${stack.project} also has ${outside.length} container(s) outside this scope; refusing to act on them.` }
   }
   const key = opKey(worktree, id)
   if (composeOps.has(key)) return { busy: true }
-  composeOps.set(key, action)
   // Compose scopes: by project name only (no -f, cwd '/'), so label values can never point compose at a directory.
-  const args = ['compose', ...(stack.project ? ['-p', stack.project] : []), ...stack.files.flatMap((f) => ['-f', f]), ...COMPOSE_ACTIONS[action]]
-  execFile(DOCKER, args, { cwd: kind === 'compose' ? '/' : stack.workdir, env: { ...COLIMA_ENV, DOCKER_HOST }, maxBuffer: 8 * 1024 * 1024 }, (err, _stdout, stderr) => {
+  const args = dockerArgs(['compose', ...(stack.project ? ['-p', stack.project] : []), ...stack.files.flatMap((f) => ['-f', f]), ...COMPOSE_ACTIONS[action]])
+  composeOps.set(key, action)
+  execFile(DOCKER, args, { cwd: kind === 'compose' ? '/' : stack.workdir, env: CHILD_ENV, maxBuffer: 8 * 1024 * 1024 }, (err, _stdout, stderr) => {
     composeOps.delete(key)
     const payload = err
       ? { stack: id, worktree, action, ok: false, error: String(stderr || err).trim().slice(-ERROR_MAX_CHARS) }
@@ -429,21 +583,111 @@ export function buildOverview(containers, worktrees, repos) {
   }
 }
 
-// Single in-flight VM operation (start/stop/restart); it outlives any request, so it is tracked here.
+// Single in-flight engine operation (start/stop/restart); it outlives any request, so it is tracked here.
 let vmOpName = null // 'starting' | 'stopping' | 'restarting' | null
-const VM_OP_NAMES = { stop: 'stopping', restart: 'restarting' }
+const VM_OP_NAMES = { start: 'starting', stop: 'stopping', restart: 'restarting' }
+const START_WAIT_MS = 120000 // apps without a CLI (`open -a`): wait this long for the engine to answer
+const START_POLL_MS = 3000
+
+const colimaProfileArgs = (ad) => (ad.profile && ad.profile !== 'default' ? ['--profile', ad.profile] : [])
+
+// Which binary the adapter needs; null = nothing to install (generic engines).
+function adapterBinary(ad) {
+  switch (ad.kind) {
+    case 'colima': return { name: 'colima', path: COLIMA }
+    case 'orbstack': return { name: 'orb', path: ORB }
+    case 'podman': return { name: 'podman', path: PODMAN }
+    case 'rancher': return { name: 'rdctl', path: RDCTL }
+    case 'desktop': return { name: 'Docker Desktop', path: DESKTOP_PLUGIN ?? (existsSync(DESKTOP_APP) ? DESKTOP_APP : null) }
+    default: return null
+  }
+}
+
+// Steps that perform `op` for the adapter, or null when it cannot be controlled from here.
+// A step is { bin, args, wait? }; steps run one after another and stop at the first failure.
+// Verified against real CLIs: colima. UNTESTED (written from the vendors' docs, CLI not installed here):
+// docker desktop plugin, `open -a Docker`, orb, podman machine, rdctl.
+export function enginePlan(ad, op, size) {
+  const bin = adapterBinary(ad)
+  if (bin && !bin.path) return null
+  switch (ad.kind) {
+    case 'colima': {
+      const p = colimaProfileArgs(ad)
+      if (op === 'start') return [{ bin: COLIMA, args: ['start', ...p, '--cpu', String(size?.cpu ?? 2), '--memory', String(size?.memory ?? 2)] }]
+      return [{ bin: COLIMA, args: [op, ...p] }]
+    }
+    case 'desktop': // plugin binaries are called as `docker-desktop desktop <cmd>`, as the docker CLI does
+      if (DESKTOP_PLUGIN) return [{ bin: DESKTOP_PLUGIN, args: ['desktop', op] }]
+      return op === 'start' ? [{ bin: '/usr/bin/open', args: ['-a', 'Docker'], wait: true }] : null
+    case 'orbstack': {
+      const start = { bin: ORB, args: ['start'] }
+      const stop = { bin: ORB, args: ['stop'] }
+      return op === 'start' ? [start] : op === 'stop' ? [stop] : [stop, start]
+    }
+    case 'podman': {
+      const m = ad.machine ? [ad.machine] : []
+      const start = { bin: PODMAN, args: ['machine', 'start', ...m] }
+      const stop = { bin: PODMAN, args: ['machine', 'stop', ...m] }
+      return op === 'start' ? [start] : op === 'stop' ? [stop] : [stop, start]
+    }
+    case 'rancher': {
+      const start = { bin: RDCTL, args: ['start'] }
+      const stop = { bin: RDCTL, args: ['shutdown'] }
+      return op === 'start' ? [start] : op === 'stop' ? [stop] : [stop, start]
+    }
+    default: return null
+  }
+}
+
+// What the panel may offer for the adapter.
+function engineControls(ad) {
+  const bin = adapterBinary(ad)
+  const probe = { cpu: 1, memory: 1 }
+  const live = !contextMissing // a vanished context gets no actions until the user picks another engine
+  return {
+    installed: bin ? Boolean(bin.path) : true,
+    missing: bin && !bin.path ? `${bin.name} not found.` : null,
+    start: live && enginePlan(ad, 'start', probe) !== null,
+    stop: live && enginePlan(ad, 'stop', probe) !== null,
+    restart: live && enginePlan(ad, 'restart', probe) !== null,
+    size: ad.kind === 'colima' // CPU/RAM can only be chosen where a CLI takes them
+  }
+}
+
+// `docker info` through the chosen context: reachability plus the engine's own CPU/memory/version.
+async function dockerInfo() {
+  let args
+  try { args = dockerArgs(['info', '--format', '{{.NCPU}}|{{.MemTotal}}|{{.ServerVersion}}']) } catch { return { ok: false } }
+  const res = await run(DOCKER, args, 8000)
+  if (!res.ok) return { ok: false }
+  const [cpu, memory, version] = res.stdout.trim().split('|')
+  return { ok: true, cpu: Number(cpu) || 0, memory: Number(memory) || 0, version: version || '' }
+}
 
 async function vmStatus() {
-  if (!COLIMA) return { installed: false, running: false, starting: vmOpName === 'starting', op: vmOpName }
-  const res = await new Promise((resolve) => {
-    execFile(COLIMA, ['status', '--json'], { cwd: '/', env: COLIMA_ENV, timeout: 20000 },
-      (error, stdout) => resolve({ ok: !error, stdout }))
-  })
-  if (!res.ok) return { installed: true, running: false, starting: vmOpName === 'starting', op: vmOpName }
-  try {
-    const j = JSON.parse(res.stdout)
-    return { installed: true, running: true, starting: vmOpName === 'starting', op: vmOpName, cpu: j.cpu, memory: j.memory, disk: j.disk, runtime: j.runtime, arch: j.arch }
-  } catch { return { installed: true, running: false, starting: vmOpName === 'starting', op: vmOpName } }
+  const ad = activeAdapter()
+  const controls = engineControls(ad)
+  const base = { installed: controls.installed, starting: vmOpName === 'starting', op: vmOpName }
+  if (!controls.installed || contextMissing) return { ...base, running: false }
+  if (ad.kind === 'colima') {
+    const res = await new Promise((resolve) => {
+      execFile(COLIMA, ['status', ...colimaProfileArgs(ad), '--json'], { cwd: '/', env: CHILD_ENV, timeout: 20000 },
+        (error, stdout) => resolve({ ok: !error, stdout }))
+    })
+    if (!res.ok) return { ...base, running: false }
+    try {
+      const j = JSON.parse(res.stdout)
+      return { ...base, running: true, cpu: j.cpu, memory: j.memory, disk: j.disk, runtime: j.runtime, arch: j.arch }
+    } catch { return { ...base, running: false } }
+  }
+  const info = await dockerInfo()
+  return info.ok ? { ...base, running: true, cpu: info.cpu, memory: info.memory, version: info.version } : { ...base, running: false }
+}
+
+// Everything the Engine card needs besides the status itself.
+function engineInfo() {
+  const ad = activeAdapter()
+  return { engine: { name: activeContext, kind: ad.kind, label: ad.label, missing: contextMissing }, engines: engineList(), controls: engineControls(ad) }
 }
 
 // Host limits for the VM size; the panel shows them, the worker enforces them.
@@ -471,40 +715,71 @@ async function loadPrefs(orca) {
   return { cpu: Math.min(DEFAULT_PREFS.cpu, maxCpu), memory: Math.min(DEFAULT_PREFS.memory, maxMemory) }
 }
 
-async function startVm(orca, input) {
-  if (!COLIMA) return { started: false, error: 'colima binary not found.' }
-  if (vmOpName) return { starting: vmOpName === 'starting', op: vmOpName, error: `Colima is ${vmOpName}` }
-  const size = parseVmSize(input)
-  if (size.error) return { started: false, error: size.error }
-  vmOpName = 'starting'
-  try {
-    await orca.host.call('storage.set', { key: PREFS_KEY, value: { cpu: size.cpu, memory: size.memory } })
-  } catch { /* persisting the choice is best-effort */ }
-  execFile(COLIMA, ['start', '--cpu', String(size.cpu), '--memory', String(size.memory)], { cwd: '/', env: COLIMA_ENV, maxBuffer: 8 * 1024 * 1024 }, (error, _stdout, stderr) => {
+const runStep = (step) => new Promise((resolve) => {
+  execFile(step.bin, step.args, { cwd: '/', env: CHILD_ENV, maxBuffer: 8 * 1024 * 1024 },
+    (error, _stdout, stderr) => resolve(error ? String(stderr || error).trim().slice(-ERROR_MAX_CHARS) : null))
+})
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+// Runs the plan in the background; one op at a time. Reports through the panel posts the panel already listens to.
+function launchEngineOp(orca, ad, op, steps) {
+  vmOpName = VM_OP_NAMES[op]
+  ;(async () => {
+    let failure = null
+    try {
+      for (const step of steps) {
+        failure = await runStep(step)
+        if (failure) break
+        if (step.wait) {
+          const until = Date.now() + START_WAIT_MS
+          let up = (await dockerInfo()).ok
+          while (!up && Date.now() < until) { await sleep(START_POLL_MS); up = (await dockerInfo()).ok }
+          if (!up) { failure = `${ad.label} was opened but Docker did not answer within ${START_WAIT_MS / 1000}s.`; break }
+        }
+      }
+    } catch (e) { failure = String(e?.message ?? e).slice(0, ERROR_MAX_CHARS) }
     vmOpName = null
-    const payload = error
-      ? { ok: false, error: String(stderr || error).trim().slice(-ERROR_MAX_CHARS) }
-      : { ok: true }
-    orca.panels.post('colima.started', payload)
-  })
-  return { started: true }
+    if (op === 'start') orca.panels.post('colima.started', failure ? { ok: false, error: failure } : { ok: true })
+    else orca.panels.post('colima.vmOp.done', failure ? { op, ok: false, error: failure } : { op, ok: true })
+  })()
+  return { started: true, op: VM_OP_NAMES[op] }
 }
 
-// Stops or restarts the VM in the background; only one VM operation runs at a time.
+async function startVm(orca, input) {
+  const ad = activeAdapter()
+  if (contextMissing) return { started: false, error: guardEngine(activeContext, activeContext, true) }
+  const controls = engineControls(ad)
+  if (!controls.installed) return { started: false, error: controls.missing }
+  if (vmOpName) return { starting: vmOpName === 'starting', op: vmOpName, error: `${ad.label} is ${vmOpName}` }
+  let size = null
+  if (controls.size) {
+    size = parseVmSize(input)
+    if (size.error) return { started: false, error: size.error }
+  }
+  const steps = enginePlan(ad, 'start', size)
+  if (!steps) return { started: false, error: `${ad.label} cannot be started from here.` }
+  if (size) {
+    try {
+      await orca.host.call('storage.set', { key: PREFS_KEY, value: { cpu: size.cpu, memory: size.memory } })
+    } catch { /* persisting the choice is best-effort */ }
+  }
+  if (vmOpName) return { starting: vmOpName === 'starting', op: vmOpName, error: `${ad.label} is ${vmOpName}` } // lost a race while saving
+  return launchEngineOp(orca, ad, 'start', steps)
+}
+
+// Stops or restarts the engine in the background; only one operation runs at a time.
 function vmOp(orca, input) {
   const op = input?.op
   if (op !== 'stop' && op !== 'restart') return { started: false, error: 'Unknown VM operation.' }
-  if (!COLIMA) return { started: false, error: 'colima binary not found.' }
-  if (vmOpName) return { started: false, busy: true, op: vmOpName, error: `Colima is ${vmOpName}` }
-  vmOpName = VM_OP_NAMES[op]
-  execFile(COLIMA, [op], { cwd: '/', env: COLIMA_ENV, maxBuffer: 8 * 1024 * 1024 }, (error, _stdout, stderr) => {
-    vmOpName = null
-    const payload = error
-      ? { op, ok: false, error: String(stderr || error).trim().slice(-ERROR_MAX_CHARS) }
-      : { op, ok: true }
-    orca.panels.post('colima.vmOp.done', payload)
-  })
-  return { started: true, op: VM_OP_NAMES[op] }
+  const ad = activeAdapter()
+  if (contextMissing) return { started: false, error: guardEngine(activeContext, activeContext, true) }
+  const controls = engineControls(ad)
+  if (!controls.installed) return { started: false, error: controls.missing }
+  if (vmOpName) return { started: false, busy: true, op: vmOpName, error: `${ad.label} is ${vmOpName}` }
+  const steps = enginePlan(ad, op, null)
+  if (!steps) return { started: false, error: `${ad.label} cannot be ${op === 'stop' ? 'stopped' : 'restarted'} from here.` }
+  return launchEngineOp(orca, ad, op, steps)
 }
 
 const UNITS = { b: 1, kb: 1e3, mb: 1e6, gb: 1e9, tb: 1e12, kib: 1024, mib: 1024 ** 2, gib: 1024 ** 3, tib: 1024 ** 4 }
@@ -601,8 +876,8 @@ const savePids = () => {
 
 // Spawns `docker <args>` under the watchdog. stdout/stderr are docker's own. Stop it with stopDocker().
 function spawnDocker(args) {
-  const proc = spawn('/bin/sh', ['-c', WATCHDOG_SCRIPT, WATCHDOG_MARKER, DOCKER, ...args],
-    { cwd: '/', env: { ...process.env, DOCKER_HOST }, stdio: ['pipe', 'pipe', 'pipe'], detached: true })
+  const proc = spawn('/bin/sh', ['-c', WATCHDOG_SCRIPT, WATCHDOG_MARKER, DOCKER, ...dockerArgs(args)],
+    { cwd: '/', env: CHILD_ENV, stdio: ['pipe', 'pipe', 'pipe'], detached: true })
   proc.stdin.on('error', () => {}) // EPIPE if the wrapper is already gone
   proc.reaped = false
   if (proc.pid) { liveWrappers.add(proc.pid); savePids() }
@@ -770,8 +1045,8 @@ async function olderLogs(orca, input) {
   let tail = LOG_OLDER_LINES + skip
   for (;;) {
     const res = await new Promise((resolve) => {
-      execFile(DOCKER, ['logs', '--timestamps', '--until', until, '--tail', String(tail), target.id],
-        { cwd: '/', env: { ...process.env, DOCKER_HOST }, maxBuffer: 64 * 1024 * 1024, timeout: 20000 },
+      execFile(DOCKER, dockerArgs(['logs', '--timestamps', '--until', until, '--tail', String(tail), target.id]),
+        { cwd: '/', env: CHILD_ENV, maxBuffer: 64 * 1024 * 1024, timeout: 20000 },
         (error, stdout, stderr) => resolve({ error, stdout, stderr }))
     })
     if (res.error) return { ok: false, message: (res.stderr || String(res.error)).slice(0, 300) }
@@ -792,8 +1067,6 @@ async function olderLogs(orca, input) {
 }
 
 // ---- Log search and context ----
-const logsEnv = () => ({ ...process.env, DOCKER_HOST })
-
 // Splits a stream into lines (one splitter per stream, so partial lines never mix).
 function lineSplitter(onLine) {
   let rest = ''
@@ -893,8 +1166,8 @@ async function contextLogs(orca, input) {
   const { target } = await ownedContainer(orca, String(input?.id ?? ''), input?.scope)
   if (!target) return NOT_OWNED
   const before = await new Promise((resolve) => {
-    execFile(DOCKER, ['logs', '--timestamps', '--until', ts, '--tail', String(CONTEXT_LINES + 10), target.id],
-      { cwd: '/', env: logsEnv(), maxBuffer: 16 * 1024 * 1024, timeout: CONTEXT_TIMEOUT_MS },
+    execFile(DOCKER, dockerArgs(['logs', '--timestamps', '--until', ts, '--tail', String(CONTEXT_LINES + 10), target.id]),
+      { cwd: '/', env: CHILD_ENV, maxBuffer: 16 * 1024 * 1024, timeout: CONTEXT_TIMEOUT_MS },
       (error, stdout, stderr) => resolve({ error, stdout, stderr }))
   })
   if (before.error) return { ok: false, message: (before.stderr || String(before.error)).slice(0, 300) }
@@ -971,8 +1244,8 @@ async function statsForScope(orca, scope) {
   const ids = state.containers.filter((c) => c.state === 'running').map((c) => c.id)
   if (ids.length === 0) return { ok: true, stats: {} }
   const res = await new Promise((resolve) => {
-    execFile(DOCKER, ['stats', '--no-stream', '--format', '{{json .}}', ...ids],
-      { cwd: '/', env: { ...process.env, DOCKER_HOST }, maxBuffer: 8 * 1024 * 1024, timeout: 15000 },
+    execFile(DOCKER, dockerArgs(['stats', '--no-stream', '--format', '{{json .}}', ...ids]),
+      { cwd: '/', env: CHILD_ENV, maxBuffer: 8 * 1024 * 1024, timeout: 15000 },
       (error, stdout, stderr) => resolve({ stdout, stderr: stderr || String(error ?? '') }))
   })
   const stats = {}
@@ -991,9 +1264,10 @@ async function statsForScope(orca, scope) {
 export const shellQuote = (text) => `'${String(text).replaceAll("'", "'\\''")}'`
 
 // The command line typed into the new Orca terminal. Throws on an id that is not a hex container id.
-export function buildShellCommand(dockerBin, dockerHost, id) {
+// `--context` is explicit, so the user's own DOCKER_HOST/DOCKER_CONTEXT cannot redirect the shell to another engine.
+export function buildShellCommand(dockerBin, context, id) {
   if (!CONTAINER_ID_RE.test(id)) throw new Error('Invalid container id.')
-  return `DOCKER_HOST=${shellQuote(dockerHost)} ${shellQuote(dockerBin)} exec -it ${shellQuote(id)} sh`
+  return `${shellQuote(dockerBin)}${context ? ` --context ${shellQuote(context)}` : ''} exec -it ${shellQuote(id)} sh`
 }
 
 const NOT_OWNED = { ok: false, message: 'Container is not in the shown scope.' }
@@ -1001,9 +1275,24 @@ const NOT_OWNED = { ok: false, message: 'Container is not in the shown scope.' }
 export default async function activate(orca) {
   cleanupStaleDocker()
   // Every handler call proves the panel is alive; followers of silent panels are swept.
+  // The engine is captured once per request; results are tagged with it so the panel can drop answers
+  // that belong to a previous engine. engine.set is exempt: it is the one handler that changes the engine.
   const handle = (name, fn) => orca.panels.handle(name, async (input, ctx) => {
     if (ctx?.panel?.id) lastSeen.set(ctx.panel.id, Date.now())
-    return fn(input, ctx)
+    await ensureEngine(orca)
+    if (name === 'engine.set') return fn(input, ctx)
+    const engine = activeContext
+    try {
+      const out = await engineScope.run({ engine }, () => fn(input, ctx))
+      return out && typeof out === 'object' && !Array.isArray(out) ? { ...out, engineName: engine } : out
+    } catch (e) {
+      if (!(e instanceof EngineError)) throw e
+      // Shaped so every panel consumer (state, overview, actions, VM calls) can read it as a failure.
+      return {
+        ok: false, started: false, error: e.message, message: e.message, engineName: engine, worktree: null, containers: [], stacks: [], projects: [],
+        other: { running: 0, total: 0, projects: [] }, individual: { running: 0, total: 0, containers: [] }
+      }
+    }
   })
   const sweeper = setInterval(() => { sweepFollowers(orca).catch(() => {}) }, SWEEP_MS)
   sweeper.unref?.()
@@ -1037,7 +1326,28 @@ export default async function activate(orca) {
     return { view: 'worktree' }
   })
 
-  handle('colima.vm', async () => ({ ...(await vmStatus()), prefs: await loadPrefs(orca), limits: hostLimits() }))
+  handle('colima.vm', async () => {
+    // Contexts come and go (docker context create/rm): re-read them, and re-pick if the chosen one vanished.
+    await loadContexts()
+    const [status, prefs] = await Promise.all([vmStatus(), loadPrefs(orca)])
+    return { ...status, ...engineInfo(), prefs, limits: hostLimits() }
+  })
+
+  // Switches the engine. Only a context from the live list is accepted; everything bound to the old engine is dropped.
+  handle('engine.set', async (input) => {
+    await loadContexts(true)
+    const entry = validateContext(input?.name, contexts)
+    if (!entry) return { ok: false, message: 'Unknown engine.' }
+    if (vmOpName) return { ok: false, message: `The engine is ${vmOpName}.` }
+    killAll()
+    listsCache = { at: 0, value: null }
+    pathCache = { key: null, path: null, error: null, at: 0 }
+    activeContext = entry.name
+    activeSnapshot = entry
+    contextMissing = false
+    try { await orca.host.call('storage.set', { key: ENGINE_KEY, value: entry.name }) } catch { /* best-effort */ }
+    return { ok: true, name: entry.name }
+  })
   handle('colima.start', async (input) => startVm(orca, input))
   handle('colima.vmOp', async (input) => vmOp(orca, input))
 
@@ -1055,7 +1365,7 @@ export default async function activate(orca) {
     if (!CONTAINER_ACTIONS.includes(action)) return { ok: false, message: 'Unknown action.' }
     const { target } = await ownedContainer(orca, String(input?.id ?? ''), input?.scope, true)
     if (!target) return NOT_OWNED
-    const res = await run(DOCKER, [action, target.id], CONTAINER_ACTION_TIMEOUT_MS)
+    const res = await run(DOCKER, dockerArgs([action, target.id]), CONTAINER_ACTION_TIMEOUT_MS)
     return res.ok ? { ok: true } : { ok: false, message: res.stderr.slice(0, 300) }
   })
 
@@ -1066,12 +1376,12 @@ export default async function activate(orca) {
     if (!CONTAINER_ID_RE.test(target.id)) return { ok: false, message: 'Unexpected container id.' }
     if (target.state !== 'running') return { ok: false, message: 'A shell needs a running container.' }
     const res = await orcaJson(['terminal', 'create', '--worktree', `path:${worktree}`, '--title', `sh ${target.name}`,
-      '--command', buildShellCommand(DOCKER, DOCKER_HOST, target.id), '--focus'])
+      '--command', buildShellCommand(DOCKER, activeContext, target.id), '--focus'])
     return res.ok ? { ok: true } : { ok: false, message: `orca CLI failed: ${String(res.error?.message ?? '').slice(0, 200)}` }
   })
 
   orca.commands.register('colima.refresh', async () => {
     orca.panels.post('colima.refresh', {})
-    await orca.host.call('notifications.show', { title: 'Colima', body: 'Refresh requested.' })
+    await orca.host.call('notifications.show', { title: 'Containers', body: 'Refresh requested.' })
   })
 }
