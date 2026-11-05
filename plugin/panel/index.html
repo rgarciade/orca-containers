@@ -1097,11 +1097,11 @@
     else gotoHit(hitIdx + (e.shiftKey ? -1 : 1))
   })
 
-  window.orca.on('colima.logs.chunk', (res) => {
+  window.orca.plugin.on('colima.logs.chunk', (res) => {
     if (res && res.id === logsId && logsMode === 'live' && typeof res.text === 'string') appendLogs(res.text)
   })
 
-  window.orca.on('colima.logs.end', (res) => {
+  window.orca.plugin.on('colima.logs.end', (res) => {
     if (res && res.id === logsId && logsMode === 'live') setLogsState(false, LOGS_END_LABELS[res.reason] || 'Stopped')
   })
 
@@ -1251,19 +1251,19 @@
     if (btn) btn.textContent = `Start Colima (${size.cpu} CPU, ${size.memory} GB)`
   })
 
-  window.orca.on('colima.started', (res) => {
+  window.orca.plugin.on('colima.started', (res) => {
     vmError = res && !res.ok ? { title: 'Start', text: res.error || 'Unknown error' } : null
     busy = false
     refresh()
   })
 
-  window.orca.on('colima.vmOp.done', (res) => {
+  window.orca.plugin.on('colima.vmOp.done', (res) => {
     vmError = res && !res.ok ? { title: res.op === 'stop' ? 'Stop' : 'Restart', text: res.error || 'Unknown error' } : null
     busy = false
     refresh()
   })
 
-  window.orca.on('colima.compose.done', (res) => {
+  window.orca.plugin.on('colima.compose.done', (res) => {
     if (res && res.stack) {
       const key = stackKey(res.stack, res.worktree)
       if (res.ok) delete composeErrors[key]
@@ -1500,7 +1500,7 @@
   }
   function stopPolling() { if (logsId) setLogsState(false, "Paused"); clearInterval(timer); clearInterval(ctxTimer); clearInterval(statsTimer); timer = null; ctxTimer = null; statsTimer = null }
   document.addEventListener('visibilitychange', () => document.hidden ? stopPolling() : startPolling())
-  window.orca.on('colima.refresh', refresh)
+  window.orca.plugin.on('colima.refresh', refresh)
   // Focus or terminal changes arrive as events. Each new subscriber first gets the current context,
   // so the first event also proves the subscription works; until then (or if it never comes) the
   // 700ms watcher stays on as a fallback.

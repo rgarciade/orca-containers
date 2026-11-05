@@ -71,3 +71,6 @@ No API to create/open an Orca terminal. Only `terminal.sendText` into an EXISTIN
 
 ## CORRECTION (2026-11-04): panel<->worker bridge EXISTS
 Host API minor 2: panel calls `window.orca.host.call("plugin.request", {name, input, timeoutMs})`; worker answers with `orca.panels.handle(name, fn)` and pushes `orca.panels.post(event, payload, panelId?)`; panel listens with `orca.on(event)`. Limits: input 64KiB, result 1MiB, post 256KiB, 200 posts/10s. Source: .../out/shared/plugins/workers/plugin-host-api-panel-methods.js and plugin-panel-bridge-protocol.js. Reference plugin: ~/Library/Application Support/orca/plugins/thailoc-dev.dev-toolbox (panel icon "wrench", right sidebar). Supersedes "no panel<->worker channel" above.
+
+## GOTCHA (2026-11-05): listening to worker posts
+Worker `orca.panels.post(event, payload)` reaches the panel ONLY through `window.orca.plugin.on(event, fn)`. `window.orca.on(event)` is for Orca domain events (workspace.changed, agent.status.changed, ...). Source: out/shared/plugins/frames/plugin-panel-shell-facades.js (`receivePush`: kind "message" fires pluginListeners).
