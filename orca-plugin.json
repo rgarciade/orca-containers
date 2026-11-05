@@ -1,10 +1,11 @@
 {
   "manifestVersion": 2,
   "execution": "trusted-worker",
-  "id": "colima",
-  "publisher": "local",
+  "id": "containers",
   "name": "Containers",
   "version": "0.1.0",
+  "author": { "name": "Raul Garcia de la Fuente", "url": "https://github.com/rgarciade" },
+  "repository": "https://github.com/rgarciade/orca-containers",
   "description": "Manage your Docker engine (Colima, Docker Desktop, OrbStack, Podman, Rancher Desktop or any Docker context) and the Compose stacks, containers, ports and logs of the active worktree from Orca's right sidebar.",
   "license": "MIT",
   "engines": { "orca": ">=1.4.246" },

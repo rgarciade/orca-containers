@@ -33,8 +33,12 @@ tested against a real CLI; the other engine controls follow each vendor's docume
 
 ## Install
 
-Settings → Plugins → **Development folders…** → add this `plugin/` folder, then approve the
-plugin. Open the **Containers** panel (package icon) in the right sidebar.
+In Orca, open Settings → Plugins and search for **Containers**, or install it from Git with
+`https://github.com/rgarciade/orca-containers.git#v0.1.0`. Approve the plugin, then open the
+**Containers** panel (package icon) in the right sidebar.
+
+For development, add a clone of this repository under Settings → Plugins →
+**Development folders…**.
 
 ## How the active worktree is found
 
