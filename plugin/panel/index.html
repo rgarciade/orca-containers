@@ -452,10 +452,12 @@
   // c = { state, scopeKind: 'worktree' | 'compose' | 'container', busy }
   function containerMenuItems(c) {
     const live = ['running', 'paused', 'restarting'].includes(c.state)
-    const items = [{ id: 'logs', label: 'Logs' }, { sep: true }]
+    // Inspect actions (logs, shell) first, then lifecycle actions.
+    const items = [{ id: 'logs', label: 'Logs' }]
+    if (c.scopeKind === 'worktree') items.push({ id: 'shell', label: 'Shell', disabled: c.busy || c.state !== 'running' })
+    items.push({ sep: true })
     items.push(live ? { id: 'stop', label: 'Stop', disabled: c.busy } : { id: 'start', label: 'Start', disabled: c.busy })
     items.push({ id: 'restart', label: 'Restart', disabled: c.busy })
-    if (c.scopeKind === 'worktree') items.push({ id: 'shell', label: 'Shell', disabled: c.busy || c.state !== 'running' })
     return items
   }
   // </menu-rules>
