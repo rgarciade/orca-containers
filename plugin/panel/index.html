@@ -357,7 +357,8 @@
       return
     }
     if (!state.worktree) {
-      el.innerHTML = `<div class="msg">Could not identify the active worktree.${state.worktreeError ? ` ${esc(state.worktreeError)}` : ' Open a terminal in it.'}</div>`
+      // Without a terminal Orca only tells us branch + name, which several worktrees can share.
+      el.innerHTML = `<div class="msg"><b>Open a terminal in this workspace to load its Docker containers.</b>${state.worktreeError ? `<div class="sub">${esc(state.worktreeError.replace(/\s*Open a terminal in the one you want\.\s*$/, ''))}</div>` : ''}</div>`
       return
     }
     const cs = state.containers
