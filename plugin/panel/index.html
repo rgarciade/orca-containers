@@ -545,6 +545,8 @@
   }
 
   function lineCount() { return $('logs-lines').querySelectorAll('.ln:not(.partial)').length }
+  // Lines already displayed with exactly this timestamp: the worker must not send them again.
+  function shownAt(ts) { return Array.from($('logs-lines').querySelectorAll('.ln[data-ts]:not(.partial)')).filter((el) => el.dataset.ts === ts).length }
   function firstTs() { const el = $('logs-lines').querySelector('.ln[data-ts]'); return el ? el.dataset.ts : null }
 
   // The bar's DOM is built once; updates only touch what changed, so the button node is never
@@ -620,7 +622,7 @@
     logsOlderBusy = true
     updateOlderBar()
     try {
-      const r = await request('colima.logs.older', { id, until })
+      const r = await request('colima.logs.older', { id, until, skip: initialUntil ? 0 : shownAt(until) })
       if (logsId !== id || epoch !== logsEpoch) return
       if (!r.ok) { setStatus(`older logs failed: ${r.message}`); return }
       const lines = r.text ? r.text.split('\n').filter((l) => l !== '') : []
@@ -632,6 +634,7 @@
       for (const line of lines.slice(-Math.max(room, 0))) frag.appendChild(makeLine(line.replace(/\r$/, '')))
       $('logs-lines').prepend(frag)
       if (r.done) logsOlderDone = true
+      if (r.message) setStatus(r.message)
       logsOlderBusy = false
       updateOlderBar()
       pre.scrollTop = initialUntil ? pre.scrollHeight : top + (pre.scrollHeight - before) // keep the same line in view

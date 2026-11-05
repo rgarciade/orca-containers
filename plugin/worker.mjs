@@ -455,25 +455,59 @@ export function filterOlder(lines, until) {
   return out
 }
 
+// Verified against Docker (Colima, nanosecond timestamps): `docker logs --until T` is INCLUSIVE of a line
+// stamped exactly T (until=T-1ns drops it, until=T keeps it). Paging therefore requests until = the first
+// displayed timestamp and removes the boundary lines the panel already shows (`skip`), so lines sharing
+// that timestamp are never lost.
+const LOG_OLDER_MAX_TAIL = 20000
+const LOG_OLDER_MAX_SKIP = 5000
+
+// Lines strictly older than `until`, plus the lines stamped exactly `until` that are NOT displayed yet.
+// The panel shows the last `skip` entries of the boundary timestamp, so those are dropped from the end of
+// the group. Continuation lines (no timestamp) stay attached to their parent entry.
+export function selectOlder(lines, until, skip = 0) {
+  const entries = []
+  for (const line of lines) {
+    const m = LINE_TS_RE.exec(line)
+    if (m || !entries.length) entries.push({ cmp: m ? compareTs(m[1], until) : -1, lines: [line] })
+    else entries[entries.length - 1].lines.push(line)
+  }
+  const boundary = entries.filter((e) => e.cmp === 0)
+  const shown = new Set(boundary.slice(Math.max(boundary.length - skip, 0)))
+  return entries.filter((e) => e.cmp < 0 || (e.cmp === 0 && !shown.has(e))).flatMap((e) => e.lines)
+}
+
 async function olderLogs(orca, input) {
   const until = String(input?.until ?? '')
   if (!isRfc3339(until)) return { ok: false, message: 'Invalid timestamp.' }
+  const skip = input?.skip ?? 0
+  if (!Number.isInteger(skip) || skip < 0 || skip > LOG_OLDER_MAX_SKIP) return { ok: false, message: 'Invalid skip count.' }
   const { target } = await ownedContainer(orca, String(input?.id ?? ''))
   if (!target) return NOT_OWNED
-  const res = await new Promise((resolve) => {
-    execFile(DOCKER, ['logs', '--timestamps', '--until', until, '--tail', String(LOG_OLDER_LINES), target.id],
-      { cwd: '/', env: { ...process.env, DOCKER_HOST }, maxBuffer: 16 * 1024 * 1024, timeout: 20000 },
-      (error, stdout, stderr) => resolve({ error, stdout, stderr }))
-  })
-  if (res.error) return { ok: false, message: (res.stderr || String(res.error)).slice(0, 300) }
-  // The container's stdout and stderr arrive separately: merge them back by timestamp.
-  const raw = [res.stdout, res.stderr].flatMap((s) => s.split('\n').filter((l) => l !== ''))
-  const stamped = raw.map((line, i) => ({ line, i, ts: LINE_TS_RE.exec(line)?.[1] ?? null }))
-  const sorted = stamped.every((l) => l.ts) && res.stderr
-    ? stamped.sort((a, b) => compareTs(a.ts, b.ts) || a.i - b.i).map((l) => l.line)
-    : raw
-  const lines = filterOlder(sorted, until)
-  return { ok: true, text: lines.length ? `${lines.join('\n')}\n` : '', done: raw.length < LOG_OLDER_LINES }
+  // Ask for enough extra lines to cover the already displayed boundary lines; if a page still yields
+  // nothing new (a huge run of identical timestamps), grow the tail instead of looping on the same page.
+  let tail = LOG_OLDER_LINES + skip
+  for (;;) {
+    const res = await new Promise((resolve) => {
+      execFile(DOCKER, ['logs', '--timestamps', '--until', until, '--tail', String(tail), target.id],
+        { cwd: '/', env: { ...process.env, DOCKER_HOST }, maxBuffer: 64 * 1024 * 1024, timeout: 20000 },
+        (error, stdout, stderr) => resolve({ error, stdout, stderr }))
+    })
+    if (res.error) return { ok: false, message: (res.stderr || String(res.error)).slice(0, 300) }
+    // The container's stdout and stderr arrive separately: merge them back by timestamp.
+    const raw = [res.stdout, res.stderr].flatMap((s) => s.split('\n').filter((l) => l !== ''))
+    const stamped = raw.map((line, i) => ({ line, i, ts: LINE_TS_RE.exec(line)?.[1] ?? null }))
+    const sorted = stamped.every((l) => l.ts) && res.stderr
+      ? stamped.sort((a, b) => compareTs(a.ts, b.ts) || a.i - b.i).map((l) => l.line)
+      : raw
+    const lines = selectOlder(sorted, until, skip)
+    const exhausted = raw.length < tail
+    if (lines.length || exhausted) return { ok: true, text: lines.length ? `${lines.join('\n')}\n` : '', done: exhausted }
+    if (tail >= LOG_OLDER_MAX_TAIL) {
+      return { ok: true, text: '', done: true, message: 'Too many log lines share one timestamp; older history is unreachable from here.' }
+    }
+    tail = Math.min(tail * 2, LOG_OLDER_MAX_TAIL)
+  }
 }
 
 // ---- Log search and context ----
@@ -583,6 +617,8 @@ async function contextLogs(orca, input) {
       (error, stdout, stderr) => resolve({ error, stdout, stderr }))
   })
   if (before.error) return { ok: false, message: (before.stderr || String(before.error)).slice(0, 300) }
+  // --until is inclusive: lines stamped exactly ts come back here, so the strict filter drops them; they are
+  // returned once, by the --since read below (which keeps everything >= ts), so the clicked line is never doubled.
   const older = filterOlder(sortByTs([before.stdout, before.stderr]), ts).slice(-CONTEXT_LINES)
   // --since is read a second early so the clicked line is never lost to boundary rules, then trimmed exactly.
   const sinceMs = Date.parse(ts.replace(/\.\d+/, '')) - 1000
