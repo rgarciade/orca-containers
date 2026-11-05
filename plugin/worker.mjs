@@ -1,8 +1,8 @@
 // Colima panel worker. The panel polls `colima.state`; all process execution happens here.
 import { execFile, spawn } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { readdir } from 'node:fs/promises'
-import { cpus, homedir, totalmem } from 'node:os'
+import { cpus, homedir, totalmem, tmpdir } from 'node:os'
 import { delimiter, join, relative, resolve } from 'node:path'
 
 const DOCKER_HOST = `unix://${homedir()}/.colima/default/docker.sock`
@@ -381,6 +381,84 @@ export function createChunker(post, { intervalMs = LOG_FLUSH_MS, maxChars = LOG_
   }
 }
 
+// ---- Docker log child processes that die with the worker ----
+// A hard kill of the worker (SIGKILL/crash) runs no handlers, and `docker logs -f` on an idle container
+// never writes, so it would never see SIGPIPE. macOS has no PR_SET_PDEATHSIG, so each child runs under a
+// tiny `sh` wrapper that watches its stdin: the worker holds the write end of that pipe, and the OS closes
+// it when the worker dies for any reason. On EOF the wrapper kills docker. Everything dynamic is passed as
+// positional args, never interpolated into the script.
+const WATCHDOG_MARKER = 'colima-logs-watchdog'
+const WATCHDOG_SCRIPT = [
+  'exec 3<&0',
+  '"$@" </dev/null &',
+  'pid=$!',
+  "trap 'kill $pid 2>/dev/null' TERM INT HUP",
+  '(cat <&3 >/dev/null; kill $pid 2>/dev/null) &',
+  'w=$!',
+  'wait $pid',
+  'rc=$?',
+  'kill $w 2>/dev/null',
+  'exit $rc'
+].join('\n')
+const PID_PREFIX = 'colima-orca-plugin-logs.'
+const PID_FILE_RE = /^colima-orca-plugin-logs\.(\d+)\.pids$/
+const PID_FILE = join(tmpdir(), `${PID_PREFIX}${process.pid}.pids`) // one file per worker instance
+const liveWrappers = new Set() // wrapper pids; each leads its own process group (wrapper + docker + watcher)
+
+const savePids = () => {
+  try { writeFileSync(PID_FILE, [...liveWrappers].join('\n')) } catch { /* best-effort */ }
+}
+
+// Spawns `docker <args>` under the watchdog. stdout/stderr are docker's own. Stop it with stopDocker().
+function spawnDocker(args) {
+  const proc = spawn('/bin/sh', ['-c', WATCHDOG_SCRIPT, WATCHDOG_MARKER, DOCKER, ...args],
+    { cwd: '/', env: { ...process.env, DOCKER_HOST }, stdio: ['pipe', 'pipe', 'pipe'], detached: true })
+  proc.stdin.on('error', () => {}) // EPIPE if the wrapper is already gone
+  proc.reaped = false
+  if (proc.pid) { liveWrappers.add(proc.pid); savePids() }
+  proc.on('close', () => {
+    proc.reaped = true // the pgid may be reused from now on: never signal it again
+    try { proc.stdin.destroy() } catch { /* closed */ } // EOF: lets the watcher inside the group exit
+    if (liveWrappers.delete(proc.pid)) savePids()
+  })
+  return proc
+}
+
+// Kills the wrapper's whole process group (wrapper, docker, watcher).
+function stopDocker(proc) {
+  if (proc.reaped || proc.exitCode !== null || proc.signalCode) return
+  try { process.kill(-proc.pid, 'SIGTERM') } catch { try { proc.kill('SIGTERM') } catch { /* already gone */ } }
+  try { proc.stdin.destroy() } catch { /* closed */ }
+}
+
+const ownerAlive = (pid) => {
+  try { process.kill(pid, 0); return true } catch (e) { return e.code === 'EPERM' }
+}
+
+// Startup: reap process groups left by workers that were killed hard. Only pid files whose owner worker
+// is dead are touched (live instances and our own file are never read or killed), and a group is only
+// signalled when `ps` shows its LEADER running our watchdog marker, so reused PIDs are safe.
+function cleanupStaleDocker() {
+  let files = []
+  try { files = readdirSync(tmpdir()).filter((n) => PID_FILE_RE.test(n)) } catch { return }
+  const stale = files
+    .map((n) => ({ path: join(tmpdir(), n), owner: Number(PID_FILE_RE.exec(n)[1]) }))
+    .filter((f) => f.owner !== process.pid && !ownerAlive(f.owner))
+  if (!stale.length) return
+  execFile('ps', ['-A', '-o', 'pid=,command='], { maxBuffer: 8 * 1024 * 1024 }, (error, stdout) => {
+    const leaders = new Map() // pid -> command
+    if (!error) for (const line of stdout.split('\n')) { const m = /^\s*(\d+)\s+(.*)$/.exec(line); if (m) leaders.set(Number(m[1]), m[2]) }
+    for (const f of stale) {
+      let saved = []
+      try { saved = readFileSync(f.path, 'utf8').split('\n').map(Number).filter((n) => Number.isInteger(n) && n > 1) } catch { /* unreadable */ }
+      if (!error) for (const pgid of saved) {
+        if (pgid !== process.pid && leaders.get(pgid)?.includes(WATCHDOG_MARKER)) { try { process.kill(-pgid, 'SIGTERM') } catch { /* gone */ } }
+      }
+      if (!error || !saved.length) { try { unlinkSync(f.path) } catch { /* gone */ } }
+    }
+  })
+}
+
 // Live log followers, one per panel id, and when each panel last talked to the worker.
 const followers = new Map() // panelId -> { id, proc, chunker, ended }
 const lastSeen = new Map() // panelId -> ms
@@ -391,7 +469,7 @@ function killFollower(panelId, reason, orca) {
   followers.delete(panelId)
   f.stopped = true
   f.chunker.stop()
-  try { f.proc.kill('SIGTERM') } catch { /* already gone */ }
+  stopDocker(f.proc)
   if (reason) {
     try { orca.panels.post('colima.logs.end', { id: f.id, reason }, { panel: panelId }) } catch { /* panel closed */ }
   }
@@ -402,8 +480,7 @@ async function followLogs(orca, panelId, input) {
   if (!target) return NOT_OWNED
   killFollower(panelId, null, orca)
   killSearch(panelId)
-  const proc = spawn(DOCKER, ['logs', '-f', '--timestamps', '--tail', String(LOG_TAIL_LINES), target.id],
-    { cwd: '/', env: { ...process.env, DOCKER_HOST }, stdio: ['ignore', 'pipe', 'pipe'] })
+  const proc = spawnDocker(['logs', '-f', '--timestamps', '--tail', String(LOG_TAIL_LINES), target.id])
   const chunker = createChunker((text) => orca.panels.post('colima.logs.chunk', { id: target.id, text }, { panel: panelId }))
   const f = { id: target.id, proc, chunker, stopped: false }
   followers.set(panelId, f)
@@ -575,7 +652,7 @@ async function searchLogs(orca, panelId, input, signal) {
   killSearch(panelId)
   const collector = createSearchCollector(query, input?.caseSensitive === true)
   return new Promise((resolve) => {
-    const proc = spawn(DOCKER, ['logs', '--timestamps', target.id], { cwd: '/', env: logsEnv(), stdio: ['ignore', 'pipe', 'pipe'] })
+    const proc = spawnDocker(['logs', '--timestamps', target.id])
     let settled = false
     const entry = { cancel: () => finish({ ok: false, cancelled: true, message: 'Search cancelled.' }) }
     const finish = (result) => {
@@ -584,7 +661,7 @@ async function searchLogs(orca, panelId, input, signal) {
       clearTimeout(timer)
       signal?.removeEventListener?.('abort', entry.cancel)
       if (searches.get(panelId) === entry) searches.delete(panelId)
-      try { proc.kill('SIGTERM') } catch { /* already gone */ }
+      stopDocker(proc)
       resolve(result)
     }
     const timer = setTimeout(() => finish({ ok: false, message: 'Search timed out.' }), SEARCH_TIMEOUT_MS)
@@ -637,7 +714,7 @@ function sortByTs(blocks) {
 // Reads `docker logs --since` and keeps the first `limit` lines at or after `from`, then stops the process.
 function collectFrom(id, since, from, limit) {
   return new Promise((resolve) => {
-    const proc = spawn(DOCKER, ['logs', '--timestamps', '--since', since, id], { cwd: '/', env: logsEnv(), stdio: ['ignore', 'pipe', 'pipe'] })
+    const proc = spawnDocker(['logs', '--timestamps', '--since', since, id])
     const lines = []
     let keep = false
     let done = false
@@ -645,7 +722,7 @@ function collectFrom(id, since, from, limit) {
       if (done) return
       done = true
       clearTimeout(timer)
-      try { proc.kill('SIGTERM') } catch { /* already gone */ }
+      stopDocker(proc)
       resolve(error ? { error } : { lines: sortByTs([lines.join('\n')]).slice(0, limit) })
     }
     const timer = setTimeout(() => finish('Context request timed out.'), CONTEXT_TIMEOUT_MS)
@@ -719,6 +796,7 @@ export function buildShellCommand(dockerBin, dockerHost, id) {
 const NOT_OWNED = { ok: false, message: 'Container is not in the active worktree.' }
 
 export default async function activate(orca) {
+  cleanupStaleDocker()
   // Every handler call proves the panel is alive; followers of silent panels are swept.
   const handle = (name, fn) => orca.panels.handle(name, async (input, ctx) => {
     if (ctx?.panel?.id) lastSeen.set(ctx.panel.id, Date.now())
@@ -730,7 +808,7 @@ export default async function activate(orca) {
     for (const panelId of [...followers.keys()]) killFollower(panelId, null, orca)
     for (const panelId of [...searches.keys()]) killSearch(panelId)
   }
-  process.once('exit', killAll)
+  process.once('exit', () => { killAll(); try { unlinkSync(PID_FILE) } catch { /* none */ } })
   for (const sig of ['SIGTERM', 'SIGINT']) process.once(sig, () => { killAll(); process.exit(0) })
 
   handle('colima.state', async () => stateForActiveWorktree(orca))
