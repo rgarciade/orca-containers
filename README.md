@@ -34,7 +34,7 @@ tested against a real CLI; the other engine controls follow each vendor's docume
 ## Install
 
 In Orca, open Settings → Plugins and search for **Containers**, or install it from Git with
-`https://github.com/rgarciade/orca-containers.git#v0.1.0`. Approve the plugin, then open the
+`https://github.com/rgarciade/orca-containers.git#v0.1.1`. Approve the plugin, then open the
 **Containers** panel (package icon) in the right sidebar.
 
 For development, add a clone of this repository under Settings → Plugins →
