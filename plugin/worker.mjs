@@ -239,20 +239,21 @@ async function ownedContainer(orca, id) {
   return { worktree: state.worktree, target }
 }
 
-// Single in-flight `colima start`; it outlives any request (max 120s), so it is tracked here.
-let starting = false
+// Single in-flight VM operation (start/stop/restart); it outlives any request, so it is tracked here.
+let vmOpName = null // 'starting' | 'stopping' | 'restarting' | null
+const VM_OP_NAMES = { stop: 'stopping', restart: 'restarting' }
 
 async function vmStatus() {
-  if (!COLIMA) return { installed: false, running: false, starting }
+  if (!COLIMA) return { installed: false, running: false, starting: vmOpName === 'starting', op: vmOpName }
   const res = await new Promise((resolve) => {
     execFile(COLIMA, ['status', '--json'], { cwd: '/', env: COLIMA_ENV, timeout: 20000 },
       (error, stdout) => resolve({ ok: !error, stdout }))
   })
-  if (!res.ok) return { installed: true, running: false, starting }
+  if (!res.ok) return { installed: true, running: false, starting: vmOpName === 'starting', op: vmOpName }
   try {
     const j = JSON.parse(res.stdout)
-    return { installed: true, running: true, starting, cpu: j.cpu, memory: j.memory, disk: j.disk, runtime: j.runtime, arch: j.arch }
-  } catch { return { installed: true, running: false, starting } }
+    return { installed: true, running: true, starting: vmOpName === 'starting', op: vmOpName, cpu: j.cpu, memory: j.memory, disk: j.disk, runtime: j.runtime, arch: j.arch }
+  } catch { return { installed: true, running: false, starting: vmOpName === 'starting', op: vmOpName } }
 }
 
 // Host limits for the VM size; the panel shows them, the worker enforces them.
@@ -282,21 +283,38 @@ async function loadPrefs(orca) {
 
 async function startVm(orca, input) {
   if (!COLIMA) return { started: false, error: 'colima binary not found.' }
-  if (starting) return { starting: true }
+  if (vmOpName) return { starting: vmOpName === 'starting', op: vmOpName, error: `Colima is ${vmOpName}` }
   const size = parseVmSize(input)
   if (size.error) return { started: false, error: size.error }
-  starting = true
+  vmOpName = 'starting'
   try {
     await orca.host.call('storage.set', { key: PREFS_KEY, value: { cpu: size.cpu, memory: size.memory } })
   } catch { /* persisting the choice is best-effort */ }
   execFile(COLIMA, ['start', '--cpu', String(size.cpu), '--memory', String(size.memory)], { cwd: '/', env: COLIMA_ENV, maxBuffer: 8 * 1024 * 1024 }, (error, _stdout, stderr) => {
-    starting = false
+    vmOpName = null
     const payload = error
       ? { ok: false, error: String(stderr || error).trim().slice(-ERROR_MAX_CHARS) }
       : { ok: true }
     orca.panels.post('colima.started', payload)
   })
   return { started: true }
+}
+
+// Stops or restarts the VM in the background; only one VM operation runs at a time.
+function vmOp(orca, input) {
+  const op = input?.op
+  if (op !== 'stop' && op !== 'restart') return { started: false, error: 'Unknown VM operation.' }
+  if (!COLIMA) return { started: false, error: 'colima binary not found.' }
+  if (vmOpName) return { started: false, busy: true, op: vmOpName, error: `Colima is ${vmOpName}` }
+  vmOpName = VM_OP_NAMES[op]
+  execFile(COLIMA, [op], { cwd: '/', env: COLIMA_ENV, maxBuffer: 8 * 1024 * 1024 }, (error, _stdout, stderr) => {
+    vmOpName = null
+    const payload = error
+      ? { op, ok: false, error: String(stderr || error).trim().slice(-ERROR_MAX_CHARS) }
+      : { op, ok: true }
+    orca.panels.post('colima.vmOp.done', payload)
+  })
+  return { started: true, op: VM_OP_NAMES[op] }
 }
 
 const UNITS = { b: 1, kb: 1e3, mb: 1e6, gb: 1e9, tb: 1e12, kib: 1024, mib: 1024 ** 2, gib: 1024 ** 3, tib: 1024 ** 4 }
@@ -684,6 +702,7 @@ export default async function activate(orca) {
 
   handle('colima.vm', async () => ({ ...(await vmStatus()), prefs: await loadPrefs(orca), limits: hostLimits() }))
   handle('colima.start', async (input) => startVm(orca, input))
+  handle('colima.vmOp', async (input) => vmOp(orca, input))
 
   handle('colima.compose', async (input) => composeRun(orca, input))
 

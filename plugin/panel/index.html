@@ -131,7 +131,9 @@
   let statsTimer = null
   let timer = null
   let vm = null
-  let startError = null
+  let vmError = null // { title, text } of the last failed VM operation
+  let vmConfirm = null // 'stop' | 'restart' while that VM button waits for confirmation
+  let vmConfirmTimer = null
   let size = null // { cpu, memory } chosen in the panel; seeded from saved prefs
   const CONTEXT_CHECK_MS = 700
   let shownKey = null // workspace context of the state on screen
@@ -139,6 +141,7 @@
   let ctxTimer = null
   let eventsLive = false // workspace.changed has been received: the polling watcher is not needed
   const OP_LABELS = { up: 'Starting…', down: 'Stopping…', restart: 'Restarting…' }
+  const VM_OP_LABELS = { starting: 'Starting&hellip;', stopping: 'Stopping&hellip;', restarting: 'Restarting&hellip;' }
   const CONFIRM_MS = 4000
   let confirmId = null // stack whose Down button is waiting for confirmation
   let confirmTimer = null
@@ -274,20 +277,25 @@
     const dockerDown = Boolean(state && state.error)
     let cls = vm.running ? 'running' : 'stopped'
     let label = vm.running ? 'running' : 'stopped'
-    if (vm.starting) { cls = 'starting'; label = 'starting' }
+    const vmBusy = vm.op || (vm.starting ? 'starting' : null)
+    if (vmBusy) { cls = 'starting'; label = vmBusy }
     const specs = vm.running
       ? `<div class="sub">${esc(vm.cpu)} CPU &middot; ${esc(gb(vm.memory))} RAM &middot; ${esc(gb(vm.disk))} disk${vm.runtime ? ' &middot; ' + esc(vm.runtime) : ''}${vm.arch ? ' &middot; ' + esc(vm.arch) : ''}</div>`
       : ''
     const missing = vm.installed === false ? '<div class="sub">colima binary not found.</div>' : ''
     const canStart = vm.installed !== false && (!vm.running || dockerDown)
-    const btn = vm.starting
-      ? '<div class="row"><button disabled><span class="spin"></span> Starting&hellip;</button></div>'
-      : canStart ? `<div class="size">
+    const confirming = vmConfirm
+    const vmButtons = vm.running && vm.installed !== false
+      ? `<div class="row"><button data-a="vm-op" data-c="restart">${confirming === 'restart' ? 'Confirm restart?' : 'Restart'}</button><button class="danger" data-a="vm-op" data-c="stop">${confirming === 'stop' ? 'Confirm stop?' : 'Stop'}</button></div>`
+      : ''
+    const btn = vmBusy
+      ? `<div class="row"><button disabled><span class="spin"></span> ${VM_OP_LABELS[vmBusy]}</button></div>`
+      : (canStart ? `<div class="size">
           <label>CPU <select id="size-cpu">${options(cpuChoices(vm.limits.maxCpu), size.cpu)}</select></label>
           <label>RAM <select id="size-mem">${options(memChoices(vm.limits.maxMemory, size.memory), size.memory, ' GB')}</select></label>
         </div>
-        <div class="row"><button data-a="vm-start">Start Colima (${esc(size.cpu)} CPU, ${esc(size.memory)} GB)</button></div>` : ''
-    const err = startError ? `<div class="err" style="margin-top:6px">Start failed: <span class="sub">${esc(startError)}</span></div>` : ''
+        <div class="row"><button data-a="vm-start">Start Colima (${esc(size.cpu)} CPU, ${esc(size.memory)} GB)</button></div>` : '') + vmButtons
+    const err = vmError ? `<div class="err" style="margin-top:6px">${esc(vmError.title)} failed: <span class="sub">${esc(vmError.text)}</span></div>` : ''
     el.innerHTML = `<div class="card-title">Colima VM</div><div class="vm-line"><span class="${cls}">&#9679;</span> ${label[0].toUpperCase() + label.slice(1)}</div>${specs}${missing}${btn}${err}`
   }
 
@@ -338,9 +346,10 @@
       el.innerHTML = '<div class="msg"><span class="spin"></span> Looking for containers in this worktree…</div>'
       return
     }
-    if (state.error && vm && (!vm.running || vm.starting)) {
+    if (state.error && vm && (!vm.running || vm.op || vm.starting)) {
       // The VM header already says it is stopped; the raw socket error adds nothing.
-      el.innerHTML = `<div class="msg">${vm.starting ? 'Waiting for Colima to start…' : 'Start Colima to see containers.'}</div>`
+      const waiting = { starting: 'Waiting for Colima to start…', stopping: 'Waiting for Colima to stop…', restarting: 'Waiting for Colima to restart…' }
+      el.innerHTML = `<div class="msg">${waiting[vm.op || (vm.starting ? 'starting' : '')] || 'Start Colima to see containers.'}</div>`
       return
     }
     if (state.error) {
@@ -384,6 +393,8 @@
       if (key !== shownKey && !searching) { searching = true; resetForWorkspaceSwitch(); render() }
       const [nextState, nextVm] = await Promise.all([request('colima.state', {}), request('colima.vm', {})])
       vm = nextVm
+      // The VM is going down: nothing to follow or search any more.
+      if ((vm.op === 'stopping' || vm.op === 'restarting') && logsId) closeLogs()
       // The workspace changed while the worker was answering: this result is stale.
       if (key !== await contextKey()) { renderVm(); return }
       state = nextState
@@ -794,6 +805,7 @@
     if (!b) return
     const { a, t } = b.dataset
     if (a === 'vm-start') { await startVm(b); return }
+    if (a === 'vm-op') { await vmAction(b.dataset.c); return }
     if (a === 'compose') { await composeAction(t, b.dataset.c); return }
     b.disabled = true
     setStatus(`${a}...`)
@@ -835,11 +847,38 @@
 
   async function startVm(b) {
     b.disabled = true
-    startError = null
+    vmError = null
     try {
       const r = await request('colima.start', { cpu: size.cpu, memory: size.memory })
-      if (r.error) startError = r.error
-    } catch (err) { startError = err.message }
+      if (r.error) vmError = { title: 'Start', text: r.error }
+    } catch (err) { vmError = { title: 'Start', text: err.message } }
+    busy = false
+    refresh()
+  }
+
+  function clearVmConfirm() {
+    clearTimeout(vmConfirmTimer)
+    vmConfirm = null
+    vmConfirmTimer = null
+  }
+
+  async function vmAction(op) {
+    if (vm && vm.op) return // an op is already running; don't re-arm the confirm
+    if (vmConfirm !== op) {
+      clearVmConfirm()
+      vmConfirm = op
+      vmConfirmTimer = setTimeout(() => { clearVmConfirm(); renderVm() }, CONFIRM_MS)
+      renderVm()
+      return
+    }
+    clearVmConfirm()
+    vmError = null
+    closeLogs() // containers die with the VM
+    const title = op === 'stop' ? 'Stop' : 'Restart'
+    try {
+      const r = await request('colima.vmOp', { op })
+      if (r.error) vmError = { title, text: r.error }
+    } catch (err) { vmError = { title, text: err.message } }
     busy = false
     refresh()
   }
@@ -854,7 +893,13 @@
   })
 
   window.orca.on('colima.started', (res) => {
-    startError = res && !res.ok ? (res.error || 'Unknown error') : null
+    vmError = res && !res.ok ? { title: 'Start', text: res.error || 'Unknown error' } : null
+    busy = false
+    refresh()
+  })
+
+  window.orca.on('colima.vmOp.done', (res) => {
+    vmError = res && !res.ok ? { title: res.op === 'stop' ? 'Stop' : 'Restart', text: res.error || 'Unknown error' } : null
     busy = false
     refresh()
   })
