@@ -61,7 +61,7 @@
   .ln { min-height: 1.3em; }
   .ln .ts { color: var(--orca-muted-foreground); opacity: .6; margin-right: 8px; user-select: none; }
   #logs-older { text-align: center; margin-bottom: 4px; color: var(--orca-muted-foreground); font-size: 11px; }
-  #logs-older:empty { display: none; }
+  #logs-older.none { display: none; }
   #logs-state { color: var(--orca-muted-foreground); font-size: 11px; white-space: nowrap; }
   #logs-state .live { color: #3fb950; }
   #logs-search { display: flex; align-items: center; gap: var(--space-s); flex-wrap: wrap; margin-top: var(--space-s); }
@@ -547,14 +547,41 @@
   function lineCount() { return $('logs-lines').querySelectorAll('.ln:not(.partial)').length }
   function firstTs() { const el = $('logs-lines').querySelector('.ln[data-ts]'); return el ? el.dataset.ts : null }
 
+  // The bar's DOM is built once; updates only touch what changed, so the button node is never
+  // replaced (a click spanning a chunk-driven update keeps its mousedown/mouseup target).
+  let olderBarEls = null
+  let olderBarKey = null
+
   function updateOlderBar() {
     const bar = $('logs-older')
-    if (!logsId || !firstTs()) { bar.textContent = ''; return }
-    if (logsOlderDone) { bar.textContent = 'Start of logs'; return }
-    if (lineCount() >= LOGS_MAX_LINES) { bar.textContent = 'Log view is full'; return }
-    bar.innerHTML = logsOlderBusy
-      ? '<button disabled><span class="spin"></span> Loading…</button>'
-      : '<button id="logs-load-older">Load older</button>'
+    if (!olderBarEls || olderBarEls.bar !== bar) {
+      bar.textContent = ''
+      const msg = document.createElement('span')
+      const btn = document.createElement('button')
+      btn.id = 'logs-load-older'
+      msg.hidden = true
+      btn.hidden = true
+      bar.append(msg, btn)
+      olderBarEls = { bar, msg, btn }
+      olderBarKey = null
+    }
+    let key
+    if (!logsId || !firstTs()) key = 'none'
+    else if (logsOlderDone) key = 'done'
+    else if (lineCount() >= LOGS_MAX_LINES) key = 'full'
+    else key = logsOlderBusy ? 'busy' : 'ready'
+    if (key === olderBarKey) return
+    olderBarKey = key
+    const { msg, btn } = olderBarEls
+    olderBarEls.bar.classList.toggle('none', key === 'none')
+    const text = key === 'done' ? 'Start of logs' : key === 'full' ? 'Log view is full' : ''
+    if (msg.textContent !== text) msg.textContent = text
+    msg.hidden = !text
+    const showBtn = key === 'busy' || key === 'ready'
+    btn.hidden = !showBtn
+    btn.disabled = key === 'busy'
+    if (key === 'busy') btn.innerHTML = '<span class="spin"></span> Loading…'
+    else if (key === 'ready') btn.textContent = 'Load older'
   }
 
   // Appends a chunk as whole lines; trims from the top only when the user is at the bottom.
