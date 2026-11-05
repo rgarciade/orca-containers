@@ -9,7 +9,7 @@ worktree you are working in, from a panel in [Orca](https://www.onorca.dev)'s ri
 | --- | --- |
 | **Colima VM** | Status (CPU, memory, disk, runtime, arch). Start with a chosen number of CPUs and GB of memory, remembered for next time. Stop and restart, each with a confirmation click. |
 | **Compose** | The Compose stacks of the active worktree, found from container labels and from compose files in the worktree root. Up, Restart and Down (never removes volumes; Down asks for confirmation). Long operations run in the background. |
-| **Containers** | Only the containers whose Compose working directory is inside the active worktree. Status, CPU and memory usage, start/stop, and a shell in a new Orca terminal. |
+| **Containers** | Two views, remembered between sessions. *This worktree* follows the focused workspace: containers whose Compose working directory is inside it, with status, CPU and memory usage, start/stop and a shell in a new Orca terminal. *All* is an overview tree (Orca project, worktree, containers, then other Compose projects and individual containers) with status and ports; click a worktree, a Compose project or one of its containers to open its detail view, and use **← All** to go back. |
 | **Ports** | Published ports as chips (`host port → container port`); internal-only ports are shown dashed. Click a chip to copy `host:port`. |
 | **Logs** | *Live* mode follows the container's output with timestamps. *History* mode pages back through older lines and searches the whole log (plain text, optional case sensitivity), with a jump to the context around any match. |
 

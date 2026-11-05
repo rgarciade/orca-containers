@@ -78,6 +78,29 @@
   .ln.focus { background: rgba(88, 166, 255, .18); box-shadow: inset 2px 0 0 #58a6ff; }
   #logs-context-bar { margin-bottom: 4px; }
   #logs-results .msg { padding: 4px 0; }
+  /* View switch, pinned header and the "All" overview tree. */
+  #viewbar { display: flex; align-items: center; gap: var(--space-m); flex-wrap: wrap; margin: var(--space-l) 0 var(--space-s); }
+  .seg { display: inline-flex; }
+  .seg button { border-radius: 0; margin-left: -1px; }
+  .seg button:first-child { border-radius: 4px 0 0 4px; margin-left: 0; }
+  .seg button:last-child { border-radius: 0 4px 4px 0; }
+  .pinned-name { font-weight: 600; word-break: break-all; }
+  .tree { border: 1px solid var(--orca-border); border-radius: 8px; overflow: hidden; }
+  .tree > :last-child { border-bottom: none; }
+  .tg-head { display: flex; align-items: baseline; gap: 6px; padding: var(--space-s) 12px var(--space-s) calc(12px + var(--d, 0) * 14px); background: var(--orca-card, rgba(255, 255, 255, .03)); border-bottom: 1px solid var(--orca-border); cursor: pointer; }
+  .tg-head .tg-name { font-weight: 600; word-break: break-all; }
+  .tg-head .count { margin-left: auto; padding-left: 8px; color: var(--orca-muted-foreground); font-size: 11px; white-space: nowrap; }
+  .chev { display: inline-block; width: 12px; color: var(--orca-muted-foreground); flex: none; }
+  .openable:hover { background: rgba(127, 127, 127, .12); }
+  .crow { padding: var(--space-s) 12px var(--space-s) calc(12px + var(--d, 0) * 14px + 18px); border-bottom: 1px solid var(--orca-border); }
+  .crow.openable { cursor: pointer; }
+  .crow-main { display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; }
+  .crow .st { flex: none; width: 12px; }
+  .st.running { color: #3fb950; } .st.stopped { color: #f85149; opacity: .6; } .st.other { color: #d29922; }
+  .crow .img { font-size: 11px; color: var(--orca-muted-foreground); word-break: break-all; }
+  .crow .ports { margin-top: 4px; }
+  @keyframes flash { from { background: rgba(88, 166, 255, .35); } to { background: transparent; } }
+  .item.flash { animation: flash 1.8s ease-out; }
 </style>
 </head>
 <body>
@@ -86,6 +109,7 @@
   <div id="compose" class="card"></div>
 </div>
 <div id="status"></div>
+<div id="viewbar"></div>
 <div id="content"><div class="msg">Loading...</div></div>
 <div id="logs-wrap" hidden>
   <div class="logs-head">
@@ -131,6 +155,15 @@
   let statsTimer = null
   let timer = null
   let vm = null
+  let view = 'worktree' // 'worktree' (follows the focused workspace) or 'all' (overview tree); remembered by the worker
+  let pinned = null // { scope, name, sub, focusId, focusDone }: detail view opened from the overview
+  let overview = null // latest colima.overview result
+  let modeSeq = 0 // bumped on every view / pin change: stale async results are dropped
+  const collapsed = new Set() // group keys collapsed in the tree (panel memory only)
+  const SCOPED = new Set(['colima.state', 'colima.stats', 'colima.compose', 'colima.logs.follow', 'colima.logs.older', 'colima.logs.search', 'colima.logs.context', 'colima.action', 'colima.shell'])
+  let followSeq = 0 // ordering token for logs.follow / logs.stop, so a late follow cannot outlive a stop
+  const overviewMode = () => view === 'all' && !pinned
+  const followsWorkspace = () => view === 'worktree' && !pinned
   let vmError = null // { title, text } of the last failed VM operation
   let vmConfirm = null // 'stop' | 'restart' while that VM button waits for confirmation
   let vmConfirmTimer = null
@@ -152,6 +185,9 @@
   const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]))
 
   async function request(name, input) {
+    // A pinned scope rides along on every container-level request; the worker re-validates it.
+    if (pinned && SCOPED.has(name)) input = { ...input, scope: pinned.scope }
+    if (name === 'colima.logs.follow' || name === 'colima.logs.stop') input = { ...input, token: ++followSeq }
     const res = await window.orca.host.call('plugin.request', { name, input, timeoutMs: 30000 })
     return res.output
   }
@@ -211,7 +247,7 @@
   }
 
   async function pollStats() {
-    if (statsBusy || searching || !state || state.error || !state.worktree) return
+    if (statsBusy || overviewMode() || searching || !state || state.error || !state.worktree) return
     if (!state.containers.some((c) => c.state === 'running')) { stats = {}; statsKey = shownKey; applyStats(); return }
     statsBusy = true
     const key = shownKey
@@ -299,6 +335,9 @@
     el.innerHTML = `<div class="card-title">Colima VM</div><div class="vm-line"><span class="${cls}">&#9679;</span> ${label[0].toUpperCase() + label.slice(1)}</div>${specs}${missing}${btn}${err}`
   }
 
+  // Compose errors and the Down confirmation are per scope root + stack id, so they never leak across scopes.
+  const stackKey = (id, root = state && state.worktree) => `${root}\0${id}`
+
   function renderStack(s) {
     const title = s.project || s.files[0] || s.id
     const files = s.files.length ? `<div class="sub files">${esc(s.files.join(', '))}</div>` : ''
@@ -307,25 +346,25 @@
       ? `<div class="sub"><span class="spin"></span> ${esc(OP_LABELS[s.op] || 'Working…')}</div>`
       : ''
     const off = s.op ? ' disabled' : ''
-    const confirming = confirmId === s.id
+    const confirming = confirmId === stackKey(s.id)
     const buttons = [
       s.canUp ? `<button data-a="compose" data-t="${esc(s.id)}" data-c="up"${off}>Up</button>` : '',
       s.total > 0 ? `<button data-a="compose" data-t="${esc(s.id)}" data-c="restart"${off}>Restart</button>` : '',
       s.total > 0 ? `<button class="danger" data-a="compose" data-t="${esc(s.id)}" data-c="down"${off}>${confirming ? 'Confirm down?' : 'Down'}</button>` : ''
     ].join('')
-    const err = composeErrors[s.id] ? `<div class="stack-err">${esc(composeErrors[s.id])}</div>` : ''
+    const err = composeErrors[stackKey(s.id)] ? `<div class="stack-err">${esc(composeErrors[stackKey(s.id)])}</div>` : ''
     return `<div class="stack"><div class="name">${esc(title)}</div>${files}${count}${bits}<div class="row">${buttons}</div>${err}</div>`
   }
 
   // Fills the Compose card next to the VM card; empty (and hidden) when there is nothing to show.
   function renderCompose() {
-    const ok = !searching && state && !state.error && state.worktree
+    const ok = !overviewMode() && !searching && state && !state.error && state.worktree
     const stacks = ok ? state.stacks || [] : []
     $('compose').innerHTML = stacks.length ? `<div class="card-title">Compose</div>${stacks.map(renderStack).join('')}` : ''
   }
 
   function renderContainer(c) {
-    return `<div class="item">
+    return `<div class="item" data-cid="${esc(c.id)}">
         <div class="name"><span class="${esc(c.state)}">&#9679;</span> ${esc(c.name)}</div>
         <div class="sub">${esc(c.status)}</div>
         ${renderPorts(c.ports)}
@@ -338,25 +377,115 @@
       </div>`
   }
 
+  // Message for a Docker/VM problem shared by both views; null when there is none.
+  function dockerProblemHtml(err) {
+    if (!err) return null
+    if (vm && (!vm.running || vm.op || vm.starting)) {
+      // The VM header already says it is stopped; the raw socket error adds nothing.
+      const waiting = { starting: 'Waiting for Colima to start…', stopping: 'Waiting for Colima to stop…', restarting: 'Waiting for Colima to restart…' }
+      return `<div class="msg">${waiting[vm.op || (vm.starting ? 'starting' : '')] || 'Start Colima to see containers.'}</div>`
+    }
+    return `<div class="err"><b>Docker is unreachable.</b> Is Colima running?<br><span class="sub">${esc(err)}</span></div>`
+  }
+
+  function renderViewBar() {
+    const el = $('viewbar')
+    const seg = (v, label) => `<button data-a="view" data-t="${v}" aria-pressed="${view === v}">${label}</button>`
+    const html = pinned
+      ? `<button data-a="back">&larr; All</button><span class="pinned-name">${esc(pinned.name)}</span>${pinned.sub ? `<span class="sub">${esc(pinned.sub)}</span>` : ''}`
+      : `<div class="seg" role="group" aria-label="Container view">${seg('worktree', 'This worktree')}${seg('all', 'All')}</div>`
+    if (el.dataset.html !== html) { el.innerHTML = html; el.dataset.html = html } // keeps focus across polls
+  }
+
+  const runningText = (n) => `${n.running}/${n.total} running`
+  const stIcon = (state) => (state === 'running' ? '<span class="st running" title="running">&#9655;</span>'
+    : ['exited', 'created', 'dead'].includes(state) ? `<span class="st stopped" title="${esc(state)}">&#9632;</span>`
+      : `<span class="st other" title="${esc(state)}">&#9680;</span>`)
+  const isOpen = (key) => !collapsed.has(key)
+
+  // open = { kind, v, n, b } makes the element select a worktree / compose scope; cid also highlights a container.
+  const openAttrs = (open, cid) => (open
+    ? ` role="button" tabindex="0" data-open="${esc(open.kind)}" data-v="${esc(open.v)}" data-n="${esc(open.n)}" data-b="${esc(open.b || '')}"${cid ? ` data-cid="${esc(cid)}"` : ''}`
+    : '')
+
+  function treeHead(key, depth, name, sub, counts, open) {
+    const chev = `<span class="chev"${open ? ` data-toggle="${esc(key)}"` : ''}>${isOpen(key) ? '&#9662;' : '&#9656;'}</span>`
+    const attrs = open ? openAttrs(open) : ` role="button" tabindex="0" data-toggle="${esc(key)}" aria-expanded="${isOpen(key)}"`
+    return `<div class="tg-head${open ? ' openable' : ''}" style="--d:${depth}"${attrs}>${chev}<span class="tg-name">${esc(name)}</span>${sub ? `<span class="sub">${esc(sub)}</span>` : ''}<span class="count">${esc(runningText(counts))}</span></div>`
+  }
+
+  function treeRow(c, depth, open) {
+    return `<div class="crow${open ? ' openable' : ''}" style="--d:${depth}"${openAttrs(open, open ? c.id : null)}>
+        <div class="crow-main">${stIcon(c.state)}<span class="name">${esc(c.name)}</span><span class="img">${esc(c.image)}</span></div>
+        <div class="sub">${esc(c.status)}</div>
+        ${renderPorts(c.ports)}
+      </div>`
+  }
+
+  function renderTree(o) {
+    const out = []
+    for (const p of o.projects) {
+      out.push(treeHead(`p:${p.id}`, 0, p.name, '', p))
+      if (!isOpen(`p:${p.id}`)) continue
+      for (const w of p.worktrees) {
+        const open = { kind: 'worktree', v: w.path, n: w.name, b: w.branch }
+        out.push(treeHead(`w:${w.path}`, 1, w.name, w.branch, w, open))
+        if (isOpen(`w:${w.path}`)) for (const c of w.containers) out.push(treeRow(c, 2, open))
+      }
+    }
+    if (o.other.projects.length) {
+      out.push(treeHead('other', 0, 'Other Compose projects', '', o.other))
+      if (isOpen('other')) for (const g of o.other.projects) {
+        const open = g.workdir ? { kind: 'compose', v: g.workdir, n: g.name, b: 'Compose project' } : null
+        const key = `o:${g.key}`
+        out.push(open ? treeHead(key, 1, g.name, '', g, open) : treeHead(key, 1, g.name, '', g))
+        if (isOpen(key)) for (const c of g.containers) out.push(treeRow(c, 2, open))
+      }
+    }
+    if (o.individual.containers.length) {
+      out.push(treeHead('individual', 0, 'Individual containers', '', o.individual))
+      if (isOpen('individual')) for (const c of o.individual.containers) out.push(treeRow(c, 1, null))
+    }
+    return out.join('')
+  }
+
+  function renderOverview() {
+    const el = $('content')
+    if (!overview) { el.innerHTML = '<div class="msg"><span class="spin"></span> Loading containers…</div>'; return }
+    const problem = dockerProblemHtml(overview.error)
+    if (problem) { el.innerHTML = problem; return }
+    const n = overview.projects.reduce((a, p) => a + p.total, 0) + overview.other.total + overview.individual.total
+    const running = overview.projects.reduce((a, p) => a + p.running, 0) + overview.other.running + overview.individual.running
+    const title = `<div class="section-title">Containers <span class="count">${running}/${n} running</span></div>`
+    const warn = overview.orcaError ? `<div class="msg">${esc(overview.orcaError)} Worktree grouping is unavailable.</div>` : ''
+    el.innerHTML = n === 0 ? `${title}${warn}<div class="msg">No containers.</div>` : `${title}${warn}<div class="tree">${renderTree(overview)}</div>`
+  }
+
+  // Scrolls to and briefly highlights the container the user clicked in the overview (once per pin).
+  function applyFocus() {
+    if (!pinned || pinned.focusDone || !state || searching) return
+    pinned.focusDone = true
+    if (!pinned.focusId) return
+    const el = Array.from(document.querySelectorAll('.item[data-cid]')).find((x) => x.dataset.cid === pinned.focusId)
+    if (!el) return
+    el.scrollIntoView({ block: 'center' })
+    el.classList.add('flash')
+  }
+
   function render() {
     renderVm()
     renderCompose()
+    renderViewBar()
     const el = $('content')
+    if (overviewMode()) { renderOverview(); return }
     if (searching || !state) {
-      el.innerHTML = '<div class="msg"><span class="spin"></span> Looking for containers in this worktree…</div>'
+      el.innerHTML = `<div class="msg"><span class="spin"></span> ${pinned ? 'Loading containers…' : 'Looking for containers in this worktree…'}</div>`
       return
     }
-    if (state.error && vm && (!vm.running || vm.op || vm.starting)) {
-      // The VM header already says it is stopped; the raw socket error adds nothing.
-      const waiting = { starting: 'Waiting for Colima to start…', stopping: 'Waiting for Colima to stop…', restarting: 'Waiting for Colima to restart…' }
-      el.innerHTML = `<div class="msg">${waiting[vm.op || (vm.starting ? 'starting' : '')] || 'Start Colima to see containers.'}</div>`
-      return
-    }
-    if (state.error) {
-      el.innerHTML = `<div class="err"><b>Docker is unreachable.</b> Is Colima running?<br><span class="sub">${esc(state.error)}</span></div>`
-      return
-    }
+    const problem = dockerProblemHtml(state.error)
+    if (problem) { el.innerHTML = problem; return }
     if (!state.worktree) {
+      if (pinned) { el.innerHTML = `<div class="msg">${esc(state.worktreeError || 'Could not load this scope.')}</div>`; return }
       // Without a terminal Orca only tells us branch + name, which several worktrees can share.
       el.innerHTML = `<div class="msg"><b>Open a terminal in this workspace to load its Docker containers.</b>${state.worktreeError ? `<div class="sub">${esc(state.worktreeError.replace(/\s*Open a terminal in the one you want\.\s*$/, ''))}</div>` : ''}</div>`
       return
@@ -364,13 +493,14 @@
     const cs = state.containers
     const running = cs.filter((c) => c.state === 'running').length
     const title = `<div class="section-title">Containers <span class="count">${running}/${cs.length} running</span></div>`
-    if (cs.length === 0) { el.innerHTML = `${title}<div class="msg">No containers for this worktree.</div>`; return }
+    if (cs.length === 0) { el.innerHTML = `${title}<div class="msg">No containers for this ${pinned && pinned.scope.kind === 'compose' ? 'Compose project' : 'worktree'}.</div>`; return }
     const groups = {}
     for (const c of cs) (groups[c.service ? 'Compose services' : 'Standalone'] ||= []).push(c)
     // Group headers only help when both kinds are present.
     const many = Object.keys(groups).length > 1
     el.innerHTML = title + `<div class="list">${Object.entries(groups).map(([g, items]) =>
       `${many ? `<div class="group-title">${esc(g)}</div>` : ''}${items.map(renderContainer).join('')}`).join('')}</div>`
+    applyFocus()
   }
 
   // Identifies the focused workspace, so a switch is noticed before the worker answers.
@@ -378,26 +508,45 @@
     try { return JSON.stringify(await window.orca.host.call('workspace.readContext', {})) } catch { return null }
   }
 
+  // What the detail view is showing: the pinned scope, or the focused workspace.
+  const currentKey = async () => (pinned ? `pin:${JSON.stringify(pinned.scope)}` : contextKey())
+
   // Cheap check between polls: on a workspace switch, show "looking" and fetch right away.
+  // Only the "This worktree" view follows the workspace.
   async function watchContext() {
+    if (!followsWorkspace()) return
     const key = await contextKey()
-    if (key === shownKey) return
+    if (key === shownKey || !followsWorkspace()) return
     if (!searching) { searching = true; resetForWorkspaceSwitch(); render() }
     refresh()
+  }
+
+  // "All" view: one overview call (+ the VM); no stats.
+  async function refreshOverview(seq) {
+    const [nextOverview, nextVm] = await Promise.all([request('colima.overview', {}), request('colima.vm', {})])
+    if (seq !== modeSeq) return
+    vm = nextVm
+    overview = nextOverview
+    render()
   }
 
   async function refresh() {
     if (busy) return
     busy = true
+    const seq = modeSeq
     try {
-      const key = await contextKey()
+      if (overviewMode()) { await refreshOverview(seq); return }
+      const key = await currentKey()
       if (key !== shownKey && !searching) { searching = true; resetForWorkspaceSwitch(); render() }
       const [nextState, nextVm] = await Promise.all([request('colima.state', {}), request('colima.vm', {})])
+      if (seq !== modeSeq) return
       vm = nextVm
       // The VM is going down: nothing to follow or search any more.
       if ((vm.op === 'stopping' || vm.op === 'restarting') && logsId) closeLogs()
+      // The pinned worktree / project disappeared: go back to the overview.
+      if (nextState.gone) { leavePinned(nextState.message); return }
       // The workspace changed while the worker was answering: this result is stale.
-      if (key !== await contextKey()) { renderVm(); return }
+      if (key !== await currentKey() || seq !== modeSeq) { renderVm(); return }
       state = nextState
       shownKey = key
       searching = false
@@ -406,12 +555,57 @@
       if (logsId && !state.containers.some((c) => c.id === logsId)) closeLogs()
       if (statsKey !== shownKey) pollStats()
     } catch (err) {
+      if (seq !== modeSeq) return
       state = null
       $('content').innerHTML = `<div class="err">Worker error: ${esc(err.message)}</div>`
     } finally {
-      busy = false
-      if (searching) setTimeout(watchContext, 0)
+      if (seq === modeSeq) {
+        busy = false
+        if (searching && followsWorkspace()) setTimeout(watchContext, 0)
+      }
     }
+  }
+
+  // ---- View switching ----
+  function resetDetail() {
+    modeSeq++
+    state = null
+    shownKey = null
+    searching = true
+    resetForWorkspaceSwitch()
+    busy = false
+  }
+
+  function setView(next) {
+    if (next === view && !pinned) return
+    view = next
+    pinned = null
+    resetDetail()
+    request('colima.view', { view: next }).catch(() => {})
+    render()
+    refresh()
+  }
+
+  function openScope(d) {
+    const scope = d.open === 'worktree' ? { kind: 'worktree', path: d.v } : { kind: 'compose', workdir: d.v }
+    pinned = { scope, name: d.n, sub: d.b, focusId: d.cid || null, focusDone: false }
+    resetDetail()
+    render()
+    refresh()
+  }
+
+  function leavePinned(message) {
+    pinned = null
+    resetDetail()
+    if (message) setStatus(message, 6000)
+    render()
+    refresh()
+  }
+
+  function toggleGroup(key) {
+    if (collapsed.has(key)) collapsed.delete(key)
+    else collapsed.add(key)
+    render()
   }
 
   const LOGS_END_LABELS = { exited: 'Stopped (container exited)', idle: 'Stopped (panel was idle)', 'not-owned': 'Stopped (container left this worktree)', error: 'Stopped (docker error)' }
@@ -813,10 +1007,22 @@
     copyPort(chip.dataset.copy)
   })
 
+  // Tree headers and rows are role="button": Enter or Space activates them like a click.
+  document.addEventListener('keydown', (e) => {
+    const el = e.target.closest && e.target.closest('.tg-head, .crow.openable')
+    if (!el || el !== e.target || (e.key !== 'Enter' && e.key !== ' ')) return
+    e.preventDefault()
+    el.click()
+  })
+
   document.addEventListener('click', async (e) => {
     const link = e.target.closest('.port.link')
     if (link) { await copyPort(link.dataset.copy); return }
     // (Enter/Space on a focused chip is handled by the keydown listener below.)
+    const tog = e.target.closest('[data-toggle]')
+    if (tog) { toggleGroup(tog.dataset.toggle); return }
+    const opener = e.target.closest('[data-open]')
+    if (opener) { openScope({ open: opener.dataset.open, v: opener.dataset.v, n: opener.dataset.n, b: opener.dataset.b, cid: opener.dataset.cid }); return }
     if (e.target.id === 'logs-close') { closeLogs(); return }
     if (e.target.id === 'logs-load-older') { await loadOlder(); return }
     if (e.target.id === 'logs-mode') { await (logsMode === 'live' ? startHistory() : startLive()); return }
@@ -835,6 +1041,8 @@
     const b = e.target.closest('button[data-a]')
     if (!b) return
     const { a, t } = b.dataset
+    if (a === 'view') { setView(b.dataset.t); return }
+    if (a === 'back') { leavePinned(); return }
     if (a === 'vm-start') { await startVm(b); return }
     if (a === 'vm-op') { await vmAction(b.dataset.c); return }
     if (a === 'compose') { await composeAction(t, b.dataset.c); return }
@@ -859,19 +1067,20 @@
   }
 
   async function composeAction(id, action) {
-    if (action === 'down' && confirmId !== id) {
+    const key = stackKey(id)
+    if (action === 'down' && confirmId !== key) {
       clearConfirm()
-      confirmId = id
+      confirmId = key
       confirmTimer = setTimeout(() => { clearConfirm(); if (state) render() }, CONFIRM_MS)
       render()
       return
     }
     clearConfirm()
-    delete composeErrors[id]
+    delete composeErrors[key]
     try {
       const r = await request('colima.compose', { stack: id, action })
-      if (r.ok === false) composeErrors[id] = r.message || 'Compose failed.'
-    } catch (err) { composeErrors[id] = err.message }
+      if (r.ok === false) composeErrors[key] = r.message || 'Compose failed.'
+    } catch (err) { composeErrors[key] = err.message }
     busy = false
     refresh()
   }
@@ -937,8 +1146,9 @@
 
   window.orca.on('colima.compose.done', (res) => {
     if (res && res.stack) {
-      if (res.ok) delete composeErrors[res.stack]
-      else composeErrors[res.stack] = res.error || 'Compose failed.'
+      const key = stackKey(res.stack, res.worktree)
+      if (res.ok) delete composeErrors[key]
+      else composeErrors[key] = res.error || 'Compose failed.'
     }
     busy = false
     refresh()
@@ -965,7 +1175,15 @@
       watchContext()
     })
   } catch { /* events unavailable: the watcher keeps polling */ }
-  startPolling()
+  // The remembered view decides what the first poll fetches.
+  ;(async () => {
+    try {
+      const r = await request('colima.view', {})
+      if (r && (r.view === 'all' || r.view === 'worktree')) view = r.view
+    } catch { /* default view */ }
+    render()
+    startPolling()
+  })()
 </script>
 </body>
 </html>

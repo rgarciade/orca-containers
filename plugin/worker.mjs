@@ -3,7 +3,7 @@ import { execFile, spawn } from 'node:child_process'
 import { existsSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { readdir } from 'node:fs/promises'
 import { cpus, homedir, totalmem, tmpdir } from 'node:os'
-import { delimiter, join, relative, resolve } from 'node:path'
+import { basename, delimiter, join, relative, resolve } from 'node:path'
 
 const DOCKER_HOST = `unix://${homedir()}/.colima/default/docker.sock`
 const LOG_TAIL_LINES = 200
@@ -24,6 +24,9 @@ const ORCA_BIN_DIR = '/Applications/Orca.app/Contents/Resources/bin'
 const WORKTREE_AMBIGUITY_TTL_MS = 5000 // an unresolved lookup is retried at most this often
 const GIB = 1024 ** 3
 const PREFS_KEY = 'vm-prefs'
+const VIEW_KEY = 'view'
+const VIEWS = ['worktree', 'all']
+const ORCA_LISTS_TTL_MS = 10000 // `orca worktree list` / `repo list` are cached this long for the 3s polls
 const DEFAULT_PREFS = { cpu: 4, memory: 8 }
 const COMPOSE_ACTIONS = {
   up: ['up', '-d'],
@@ -190,53 +193,207 @@ function publicStack(s, worktree) {
   }
 }
 
-async function stateForActiveWorktree(orca) {
-  const { path: worktree, error: worktreeError } = await resolveActiveWorktree(orca)
-  if (!worktree) return { worktree: null, worktreeError, containers: [], stacks: [], error: null }
-  const { error, containers } = await listContainers()
-  const mine = containers.filter((c) => inside(c.workdir, worktree))
-  const stacks = (await discoverStacks(worktree, mine)).map((s) => publicStack(s, worktree))
-  return { worktree, error, containers: mine, stacks }
+// ---- Scopes ----
+// A scope says which containers a handler works on: omitted = the active worktree; { kind: 'worktree', path }
+// = that Orca worktree; { kind: 'compose', workdir } = containers of one compose working directory. The panel
+// is never trusted: both forms are re-validated here against the live data.
+let listsCache = { at: 0, value: null }
+
+// Pure. The deepest worktree root containing `dir` (nested paths win; /a/b never captures /a/bc), or null.
+export function deepestRoot(dir, roots) {
+  let best = null
+  if (dir) for (const r of roots) if (inside(dir, r) && (!best || r.length > best.length)) best = r
+  return best
+}
+
+const worktreeRoots = (worktrees) => (worktrees ?? []).filter((w) => w && w.path && !w.isArchived).map((w) => resolve(w.path))
+
+// Containers whose compose working dir belongs to `root` itself, not to a nested worktree.
+export function containersOfWorktree(containers, worktrees, root) {
+  const r = resolve(root)
+  const roots = [...new Set([...worktreeRoots(worktrees), r])]
+  return containers.filter((c) => c.workdir && deepestRoot(resolve(c.workdir), roots) === r)
+}
+
+// Worktrees and repos from the orca CLI, cached for a few seconds (ORCA_LISTS_TTL_MS). Read-only paths accept
+// that staleness: a worktree removed in the last <=10s can still be shown or validated until the cache expires.
+// Mutating handlers pass fresh = true. { worktrees, repos, error }.
+async function orcaLists(fresh = false) {
+  if (!fresh && listsCache.value && Date.now() - listsCache.at < ORCA_LISTS_TTL_MS) return listsCache.value
+  const [wt, repos] = await Promise.all([orcaJson(['worktree', 'list']), orcaJson(['repo', 'list'])])
+  const ok = wt.ok !== false && Array.isArray(wt.result?.worktrees) && repos.ok !== false && Array.isArray(repos.result?.repos)
+  const value = {
+    worktrees: Array.isArray(wt.result?.worktrees) ? wt.result.worktrees : [],
+    repos: Array.isArray(repos.result?.repos) ? repos.result.repos : [],
+    error: ok ? null : 'Could not read the worktree list from the orca CLI.'
+  }
+  if (ok) listsCache = { at: Date.now(), value }
+  return value
+}
+
+// Pure. Exact string equality only: no normalisation, prefixes or relative paths are ever accepted.
+// Returns { kind, root } or { gone: true, error }.
+export function validateScope(scope, worktrees, containers) {
+  if (!scope || typeof scope !== 'object') return { gone: true, error: 'Invalid scope.' }
+  if (scope.kind === 'worktree') {
+    const hit = typeof scope.path === 'string' && scope.path
+      ? (worktrees ?? []).find((w) => w && !w.isArchived && w.path === scope.path)
+      : null
+    return hit ? { kind: 'worktree', root: hit.path } : { gone: true, error: 'That worktree no longer exists.' }
+  }
+  if (scope.kind === 'compose') {
+    const ok = typeof scope.workdir === 'string' && scope.workdir && (containers ?? []).some((c) => c.workdir === scope.workdir)
+    return ok ? { kind: 'compose', root: scope.workdir } : { gone: true, error: 'That Compose project no longer has containers.' }
+  }
+  return { gone: true, error: 'Invalid scope.' }
+}
+
+// Resolves a scope to { kind, root, containers (that scope's), error (docker), worktreeError, gone }.
+// `uncertain` means a transient failure (CLI/docker), so absence of a container proves nothing.
+async function loadScope(orca, scope, { fresh = false } = {}) {
+  if (scope == null) {
+    const { path, error } = await resolveActiveWorktree(orca)
+    if (!path) return { kind: 'worktree', root: null, worktreeError: error, containers: [], error: null, uncertain: true }
+    const [r, lists] = await Promise.all([listContainers(), orcaLists(fresh)])
+    const mine = lists.error ? r.containers.filter((c) => inside(c.workdir, path)) : containersOfWorktree(r.containers, lists.worktrees, path)
+    return { kind: 'worktree', root: path, containers: mine, error: r.error, uncertain: Boolean(r.error || lists.error) }
+  }
+  if (typeof scope !== 'object') return { gone: true, error: 'Invalid scope.', containers: [] }
+  if (scope.kind === 'worktree') {
+    const lists = await orcaLists(fresh)
+    // A failing CLI is not proof that the worktree is gone.
+    if (lists.error) return { kind: 'worktree', root: null, worktreeError: lists.error, containers: [], error: null, uncertain: true }
+    const v = validateScope(scope, lists.worktrees, [])
+    if (v.gone) return { ...v, containers: [] }
+    const r = await listContainers()
+    return { kind: 'worktree', root: v.root, containers: containersOfWorktree(r.containers, lists.worktrees, v.root), error: r.error, uncertain: Boolean(r.error) }
+  }
+  const r = await listContainers()
+  if (r.error) return { kind: 'compose', root: null, containers: [], error: r.error, uncertain: true }
+  const v = validateScope(scope, [], r.containers)
+  if (v.gone) {
+    // A compose project with no containers left (e.g. right after Down) keeps its pin and shows an empty list.
+    if (scope.kind === 'compose' && typeof scope.workdir === 'string' && scope.workdir) return { kind: 'compose', root: scope.workdir, containers: [], error: null }
+    return { ...v, containers: [] }
+  }
+  return { kind: 'compose', root: v.root, containers: r.containers.filter((c) => c.workdir === v.root), error: null }
+}
+
+// Compose scopes live outside Orca worktrees: their labels are untrusted. A stack is just a project name
+// taken from the containers' labels (and format-checked); no files and no working dir are ever used.
+export function composeScopeStacks(containers) {
+  const stacks = new Map()
+  for (const c of containers) {
+    if (!c.project || !PROJECT_RE.test(c.project)) continue
+    const id = `p:${c.project}`
+    if (!stacks.has(id)) stacks.set(id, { id, project: c.project, files: [], workdir: null, running: 0, total: 0 })
+    const st = stacks.get(id)
+    st.total += 1
+    if (c.state === 'running') st.running += 1
+  }
+  return [...stacks.values()]
+}
+
+const stacksForScope = async (s) => (s.kind === 'compose' ? composeScopeStacks(s.containers) : discoverStacks(s.root, s.containers))
+
+async function stateForScope(orca, scope) {
+  const s = await loadScope(orca, scope)
+  if (s.gone) return { gone: true, message: s.error, worktree: null, containers: [], stacks: [], error: null }
+  if (!s.root) return { worktree: null, worktreeError: s.worktreeError, containers: [], stacks: [], error: s.error ?? null }
+  const stacks = (await stacksForScope(s)).map((st) => publicStack(st, s.root))
+  return { worktree: s.root, error: s.error, containers: s.containers, stacks }
 }
 
 // Re-discovers server-side so the panel never supplies a path. Returns the internal stack.
-async function ownedStack(orca, id) {
-  const worktree = await resolveActiveWorktreePath(orca)
-  if (!worktree) return { error: 'Could not identify the active worktree.' }
-  const { error, containers } = await listContainers()
-  if (error) return { error: 'Docker is unreachable. Is Colima running?' }
-  const mine = containers.filter((c) => inside(c.workdir, worktree))
-  const stack = (await discoverStacks(worktree, mine)).find((s) => s.id === id)
-  return stack ? { worktree, stack } : { error: 'Stack is not in the active worktree.' }
+async function ownedStack(orca, id, scope) {
+  const s = await loadScope(orca, scope, { fresh: true })
+  if (!s.root) return { error: 'Could not identify the worktree.' }
+  if (s.error) return { error: 'Docker is unreachable. Is Colima running?' }
+  const stack = (await stacksForScope(s)).find((st) => st.id === id)
+  return stack ? { kind: s.kind, worktree: s.root, stack } : { error: 'Stack is not in the shown scope.' }
 }
 
 async function composeRun(orca, input) {
   const action = input?.action
   if (!Object.hasOwn(COMPOSE_ACTIONS, action)) return { ok: false, message: 'Unknown action.' }
   const id = String(input?.stack ?? '')
-  const { worktree, stack, error } = await ownedStack(orca, id)
+  const { kind, worktree, stack, error } = await ownedStack(orca, id, input?.scope)
   if (!stack) return { ok: false, message: error }
+  if (kind === 'compose' && action === 'up') return { ok: false, message: 'Up is not available for Compose projects outside Orca worktrees.' }
   if (action === 'up' && stack.files.length === 0) return { ok: false, message: 'No compose file known for this stack.' }
   if ((action === 'down' || action === 'restart') && stack.total === 0) return { ok: false, message: 'Stack has no containers.' }
   const key = opKey(worktree, id)
   if (composeOps.has(key)) return { busy: true }
   composeOps.set(key, action)
+  // Compose scopes: by project name only (no -f, cwd '/'), so label values can never point compose at a directory.
   const args = ['compose', ...(stack.project ? ['-p', stack.project] : []), ...stack.files.flatMap((f) => ['-f', f]), ...COMPOSE_ACTIONS[action]]
-  execFile(DOCKER, args, { cwd: stack.workdir, env: { ...COLIMA_ENV, DOCKER_HOST }, maxBuffer: 8 * 1024 * 1024 }, (err, _stdout, stderr) => {
+  execFile(DOCKER, args, { cwd: kind === 'compose' ? '/' : stack.workdir, env: { ...COLIMA_ENV, DOCKER_HOST }, maxBuffer: 8 * 1024 * 1024 }, (err, _stdout, stderr) => {
     composeOps.delete(key)
     const payload = err
-      ? { stack: id, action, ok: false, error: String(stderr || err).trim().slice(-ERROR_MAX_CHARS) }
-      : { stack: id, action, ok: true }
+      ? { stack: id, worktree, action, ok: false, error: String(stderr || err).trim().slice(-ERROR_MAX_CHARS) }
+      : { stack: id, worktree, action, ok: true }
     orca.panels.post('colima.compose.done', payload)
   })
   return { started: true }
 }
 
-// Resolves a container id only if it belongs to the active worktree.
-async function ownedContainer(orca, id) {
-  const state = await stateForActiveWorktree(orca)
-  const target = state.containers.find((c) => c.id === id)
-  return { worktree: state.worktree, target }
+// Resolves a container id only if it belongs to the scope (default: the active worktree).
+async function ownedContainer(orca, id, scope, fresh = false) {
+  const s = await loadScope(orca, scope, { fresh })
+  return { worktree: s.root, kind: s.kind, uncertain: Boolean(s.uncertain), target: s.containers.find((c) => c.id === id) }
+}
+
+// ---- Overview tree ----
+const byRunningThenName = (a, b) => (b.running > 0) - (a.running > 0) || String(a.name).localeCompare(String(b.name))
+const tally = (items) => ({ running: items.filter((c) => c.state === 'running').length, total: items.length })
+const slimContainer = (c) => ({ id: c.id, name: c.name, image: c.image, state: c.state, status: c.status, ports: c.ports })
+const sortContainers = (items) => items.map(slimContainer).sort((a, b) => (b.state === 'running') - (a.state === 'running') || a.name.localeCompare(b.name))
+
+// Pure. Orca project > worktree > containers, then "other" compose projects and individual containers.
+// A container belongs to the DEEPEST worktree that contains its compose working dir (nested paths win,
+// /a/b never captures /a/bc). Empty projects/worktrees are omitted; groups with running containers go first.
+export function buildOverview(containers, worktrees, repos) {
+  const wts = (worktrees ?? []).filter((w) => w && w.path && !w.isArchived).map((w) => ({ w, root: resolve(w.path) }))
+  const repoNames = new Map((repos ?? []).map((r) => [r.id, r.displayName || r.path]))
+  const byWorktree = new Map() // root -> containers
+  const other = new Map() // key -> { name, workdir, items }
+  const individual = []
+  for (const c of containers ?? []) {
+    if (!c.workdir && !c.project) { individual.push(c); continue }
+    const dir = c.workdir ? resolve(c.workdir) : null
+    const best = deepestRoot(dir, wts.map((t) => t.root))
+    if (best) {
+      if (!byWorktree.has(best)) byWorktree.set(best, [])
+      byWorktree.get(best).push(c)
+      continue
+    }
+    const key = `${c.project ?? ''}\0${c.workdir ?? ''}`
+    if (!other.has(key)) other.set(key, { key, name: c.project || (c.workdir ? basename(c.workdir) : 'unknown'), workdir: c.workdir ?? null, items: [] })
+    other.get(key).items.push(c)
+  }
+  const projects = new Map()
+  for (const t of wts) {
+    const items = byWorktree.get(t.root)
+    if (!items) continue
+    const id = t.w.repoId ?? ''
+    if (!projects.has(id)) projects.set(id, { id, name: repoNames.get(id) ?? 'Unknown project', worktrees: [] })
+    projects.get(id).worktrees.push({
+      path: t.w.path, name: t.w.displayName || basename(t.w.path), branch: stripRef(t.w.branch),
+      ...tally(items), containers: sortContainers(items)
+    })
+  }
+  const projectList = [...projects.values()].map((p) => ({
+    ...p, worktrees: p.worktrees.sort(byRunningThenName),
+    running: p.worktrees.reduce((n, w) => n + w.running, 0), total: p.worktrees.reduce((n, w) => n + w.total, 0)
+  })).sort(byRunningThenName)
+  const otherProjects = [...other.values()].map((g) => ({
+    key: g.key, name: g.name, workdir: g.workdir, ...tally(g.items), containers: sortContainers(g.items)
+  })).sort(byRunningThenName)
+  return {
+    projects: projectList,
+    other: { ...tally(otherProjects.flatMap((p) => p.containers)), projects: otherProjects },
+    individual: { ...tally(individual), containers: sortContainers(individual) }
+  }
 }
 
 // Single in-flight VM operation (start/stop/restart); it outlives any request, so it is tracked here.
@@ -462,6 +619,7 @@ function cleanupStaleDocker() {
 // Live log followers, one per panel id, and when each panel last talked to the worker.
 const followers = new Map() // panelId -> { id, proc, chunker, ended }
 const lastSeen = new Map() // panelId -> ms
+const followTokens = new Map() // panelId -> highest follow/stop token seen (the panel's counter)
 
 function killFollower(panelId, reason, orca) {
   const f = followers.get(panelId)
@@ -475,14 +633,27 @@ function killFollower(panelId, reason, orca) {
   }
 }
 
+// A follow older than the latest follow/stop of its panel is dropped (a stop can overtake a slow follow).
+const tokenOf = (input) => (Number.isInteger(input?.token) ? input.token : null)
+function noteToken(panelId, token) {
+  if (token === null) return true
+  const latest = followTokens.get(panelId) ?? -1
+  if (token < latest) return false
+  followTokens.set(panelId, token)
+  return true
+}
+
 async function followLogs(orca, panelId, input) {
-  const { target } = await ownedContainer(orca, String(input?.id ?? ''))
+  const token = tokenOf(input)
+  if (!noteToken(panelId, token)) return { ok: false, message: 'Superseded.' }
+  const { target } = await ownedContainer(orca, String(input?.id ?? ''), input?.scope, true)
   if (!target) return NOT_OWNED
+  if (token !== null && followTokens.get(panelId) !== token) return { ok: false, message: 'Superseded.' }
   killFollower(panelId, null, orca)
   killSearch(panelId)
   const proc = spawnDocker(['logs', '-f', '--timestamps', '--tail', String(LOG_TAIL_LINES), target.id])
   const chunker = createChunker((text) => orca.panels.post('colima.logs.chunk', { id: target.id, text }, { panel: panelId }))
-  const f = { id: target.id, proc, chunker, stopped: false }
+  const f = { id: target.id, proc, chunker, stopped: false, scope: input?.scope ?? null }
   followers.set(panelId, f)
   for (const stream of [proc.stdout, proc.stderr]) {
     stream.setEncoding('utf8')
@@ -559,7 +730,7 @@ async function olderLogs(orca, input) {
   if (!isRfc3339(until)) return { ok: false, message: 'Invalid timestamp.' }
   const skip = input?.skip ?? 0
   if (!Number.isInteger(skip) || skip < 0 || skip > LOG_OLDER_MAX_SKIP) return { ok: false, message: 'Invalid skip count.' }
-  const { target } = await ownedContainer(orca, String(input?.id ?? ''))
+  const { target } = await ownedContainer(orca, String(input?.id ?? ''), input?.scope)
   if (!target) return NOT_OWNED
   // Ask for enough extra lines to cover the already displayed boundary lines; if a page still yields
   // nothing new (a huge run of identical timestamps), grow the tail instead of looping on the same page.
@@ -647,7 +818,7 @@ function killSearch(panelId) {
 async function searchLogs(orca, panelId, input, signal) {
   const query = typeof input?.query === 'string' ? input.query : ''
   if (query.length < 1 || query.length > SEARCH_QUERY_MAX) return { ok: false, message: `Query must be 1 to ${SEARCH_QUERY_MAX} characters.` }
-  const { target } = await ownedContainer(orca, String(input?.id ?? ''))
+  const { target } = await ownedContainer(orca, String(input?.id ?? ''), input?.scope)
   if (!target) return NOT_OWNED
   killSearch(panelId)
   const collector = createSearchCollector(query, input?.caseSensitive === true)
@@ -686,7 +857,7 @@ async function searchLogs(orca, panelId, input, signal) {
 async function contextLogs(orca, input) {
   const ts = String(input?.ts ?? '')
   if (!isRfc3339(ts)) return { ok: false, message: 'Invalid timestamp.' }
-  const { target } = await ownedContainer(orca, String(input?.id ?? ''))
+  const { target } = await ownedContainer(orca, String(input?.id ?? ''), input?.scope)
   if (!target) return NOT_OWNED
   const before = await new Promise((resolve) => {
     execFile(DOCKER, ['logs', '--timestamps', '--until', ts, '--tail', String(CONTEXT_LINES + 10), target.id],
@@ -751,18 +922,19 @@ async function sweepFollowers(orca) {
   for (const [panelId, f] of [...followers]) {
     if (now - (lastSeen.get(panelId) ?? 0) > PANEL_IDLE_MS) { killFollower(panelId, 'idle', orca); continue }
     try {
-      const { target } = await ownedContainer(orca, f.id)
-      if (!target && followers.get(panelId) === f) killFollower(panelId, 'not-owned', orca)
+      const { target, uncertain } = await ownedContainer(orca, f.id, f.scope ?? undefined)
+      // Only a positive "not there" kills the follower; a failing CLI or docker is not proof.
+      if (!target && !uncertain && followers.get(panelId) === f) killFollower(panelId, 'not-owned', orca)
     } catch { /* transient failure: keep following, retry next sweep */ }
   }
   for (const panelId of [...lastSeen.keys()]) {
-    if (!followers.has(panelId) && now - lastSeen.get(panelId) > PANEL_IDLE_MS) lastSeen.delete(panelId)
+    if (!followers.has(panelId) && now - lastSeen.get(panelId) > PANEL_IDLE_MS) { lastSeen.delete(panelId); followTokens.delete(panelId) }
   }
 }
 
-// docker stats for the running containers of the active worktree. Slow (~1-2s), so it has its own handler.
-async function statsForActiveWorktree(orca) {
-  const state = await stateForActiveWorktree(orca)
+// docker stats for the running containers of the scope. Slow (~1-2s), so it has its own handler.
+async function statsForScope(orca, scope) {
+  const state = await loadScope(orca, scope)
   const ids = state.containers.filter((c) => c.state === 'running').map((c) => c.id)
   if (ids.length === 0) return { ok: true, stats: {} }
   const res = await new Promise((resolve) => {
@@ -793,7 +965,7 @@ export function buildShellCommand(dockerBin, dockerHost, id) {
   return `DOCKER_HOST=${shellQuote(dockerHost)} ${shellQuote(dockerBin)} exec -it ${shellQuote(id)} sh`
 }
 
-const NOT_OWNED = { ok: false, message: 'Container is not in the active worktree.' }
+const NOT_OWNED = { ok: false, message: 'Container is not in the shown scope.' }
 
 export default async function activate(orca) {
   cleanupStaleDocker()
@@ -811,8 +983,28 @@ export default async function activate(orca) {
   process.once('exit', () => { killAll(); try { unlinkSync(PID_FILE) } catch { /* none */ } })
   for (const sig of ['SIGTERM', 'SIGINT']) process.once(sig, () => { killAll(); process.exit(0) })
 
-  handle('colima.state', async () => stateForActiveWorktree(orca))
-  handle('colima.stats', async () => statsForActiveWorktree(orca))
+  handle('colima.state', async (input) => stateForScope(orca, input?.scope))
+  handle('colima.stats', async (input) => statsForScope(orca, input?.scope))
+
+  // One docker ps + the cached orca lists build the whole "All" tree.
+  handle('colima.overview', async () => {
+    const [{ error, containers }, lists] = await Promise.all([listContainers(), orcaLists()])
+    if (error) return { error, projects: [], other: { running: 0, total: 0, projects: [] }, individual: { running: 0, total: 0, containers: [] } }
+    return { error: null, orcaError: lists.error, ...buildOverview(containers, lists.worktrees, lists.repos) }
+  })
+
+  // The remembered container view; with `view` in the input it is saved first.
+  handle('colima.view', async (input) => {
+    if (VIEWS.includes(input?.view)) {
+      try { await orca.host.call('storage.set', { key: VIEW_KEY, value: input.view }) } catch { /* best-effort */ }
+      return { view: input.view }
+    }
+    try {
+      const { value } = await orca.host.call('storage.get', { key: VIEW_KEY })
+      if (VIEWS.includes(value)) return { view: value }
+    } catch { /* default */ }
+    return { view: 'worktree' }
+  })
 
   handle('colima.vm', async () => ({ ...(await vmStatus()), prefs: await loadPrefs(orca), limits: hostLimits() }))
   handle('colima.start', async (input) => startVm(orca, input))
@@ -821,7 +1013,7 @@ export default async function activate(orca) {
   handle('colima.compose', async (input) => composeRun(orca, input))
 
   handle('colima.logs.follow', async (input, ctx) => followLogs(orca, ctx.panel.id, input))
-  handle('colima.logs.stop', async (_input, ctx) => { killFollower(ctx.panel.id, null, orca); killSearch(ctx.panel.id); return { ok: true } })
+  handle('colima.logs.stop', async (input, ctx) => { noteToken(ctx.panel.id, tokenOf(input)); killFollower(ctx.panel.id, null, orca); killSearch(ctx.panel.id); return { ok: true } })
 
   handle('colima.logs.older', async (input) => olderLogs(orca, input))
   handle('colima.logs.search', async (input, ctx) => searchLogs(orca, ctx.panel.id, input, ctx.signal))
@@ -830,15 +1022,16 @@ export default async function activate(orca) {
   handle('colima.action', async (input) => {
     const action = input?.action
     if (action !== 'start' && action !== 'stop') return { ok: false, message: 'Unknown action.' }
-    const { target } = await ownedContainer(orca, String(input?.id ?? ''))
+    const { target } = await ownedContainer(orca, String(input?.id ?? ''), input?.scope, true)
     if (!target) return NOT_OWNED
     const res = await run(DOCKER, [action, target.id])
     return res.ok ? { ok: true } : { ok: false, message: res.stderr.slice(0, 300) }
   })
 
   handle('colima.shell', async (input) => {
-    const { worktree, target } = await ownedContainer(orca, String(input?.id ?? ''))
+    const { worktree, kind, target } = await ownedContainer(orca, String(input?.id ?? ''), input?.scope, true)
     if (!target) return NOT_OWNED
+    if (kind !== 'worktree') return { ok: false, message: 'A shell needs an Orca worktree: open this container from its worktree.' }
     if (!CONTAINER_ID_RE.test(target.id)) return { ok: false, message: 'Unexpected container id.' }
     const res = await orcaJson(['terminal', 'create', '--worktree', `path:${worktree}`, '--title', `sh ${target.name}`,
       '--command', buildShellCommand(DOCKER, DOCKER_HOST, target.id), '--focus'])
