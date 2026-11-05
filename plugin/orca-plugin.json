@@ -18,5 +18,9 @@
       { "id": "colima.refresh", "title": "Containers: refresh" }
     ]
   },
-  "capabilities": [{ "kind": "notifications:show" }, { "kind": "workspace:read" }, { "kind": "storage:own" }]
+  "capabilities": [{ "kind": "notifications:show" }, { "kind": "workspace:read" }, { "kind": "storage:own" }],
+  "cover": {
+    "path": "images/cover.png",
+    "alt": "Containers panel in Orca's sidebar: the All view grouping containers by Compose project, and a project's detail view with ports, CPU and memory"
+  }
 }
