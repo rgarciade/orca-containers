@@ -95,7 +95,9 @@
   .crow { padding: var(--space-s) 12px var(--space-s) calc(12px + var(--d, 0) * 14px + 18px); border-bottom: 1px solid var(--orca-border); }
   .crow.openable { cursor: pointer; }
   .crow-main { display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; }
-  .crow .st { flex: none; width: 12px; }
+  .crow .st { flex: none; width: 12px; display: inline-flex; align-items: center; justify-content: center; }
+  /* Drawn box instead of the ■ glyph, which renders much smaller than ▷ at this font size. */
+  .st .sq { display: block; width: 9px; height: 9px; border-radius: 2px; background: currentColor; }
   .st.running { color: #3fb950; } .st.stopped { color: #f85149; opacity: .6; } .st.other { color: #d29922; }
   .crow .img { font-size: 11px; color: var(--orca-muted-foreground); word-break: break-all; }
   .crow .ports { margin-top: 4px; }
@@ -421,7 +423,7 @@
 
   const runningText = (n) => `${n.running}/${n.total} running`
   const stIcon = (state) => (state === 'running' ? '<span class="st running" title="running">&#9655;</span>'
-    : ['exited', 'created', 'dead'].includes(state) ? `<span class="st stopped" title="${esc(state)}">&#9632;</span>`
+    : ['exited', 'created', 'dead'].includes(state) ? `<span class="st stopped" title="${esc(state)}"><i class="sq"></i></span>`
       : `<span class="st other" title="${esc(state)}">&#9680;</span>`)
   const isOpen = (key) => !collapsed.has(key)
 
