@@ -1,5 +1,4 @@
-// Compose stack discovery: label values are untrusted. Paths are checked lexically; symlinked label
-// config files are not covered here.
+// Compose stack discovery: label values are untrusted. Paths are checked as written and as real paths.
 import { after, before, describe, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
@@ -87,5 +86,59 @@ describe('discoverStacks', () => {
 
   test('returns no file stacks for an unreadable root', async () => {
     assert.deepEqual(await discoverStacks(join(base, 'missing'), []), [])
+  })
+})
+
+describe('discoverStacks with symlinks', () => {
+  let base
+  let root
+  before(() => {
+    base = mkdtempSync(join(tmpdir(), 'containers-test-links-'))
+    root = join(base, 'wt')
+    mkdirSync(join(root, 'sub'), { recursive: true })
+    mkdirSync(join(base, 'outside'))
+    writeFileSync(join(base, 'outside', 'compose.yml'), 'services: {}\n')
+    writeFileSync(join(root, 'sub', 'compose.yml'), 'services: {}\n')
+    symlinkSync(join(base, 'outside', 'compose.yml'), join(root, 'compose.yaml'))
+    symlinkSync(join(base, 'outside'), join(root, 'out'))
+    symlinkSync(join(base, 'gone'), join(root, 'dangling'))
+    symlinkSync(join(root, 'sub'), join(root, 'in'))
+    symlinkSync(root, join(base, 'alias'))
+  })
+  after(() => rmSync(base, { recursive: true, force: true }))
+
+  const stackFor = async (workdir, configFiles, from = root) =>
+    (await discoverStacks(from, [{ project: 'web', workdir, configFiles, state: 'running' }])).find((s) => s.id === 'p:web')
+
+  test('rejects the whole file list when a config file leads outside', async () => {
+    for (const file of ['compose.yaml', 'out/compose.yml', 'out/missing.yml', 'dangling']) {
+      const stack = await stackFor(root, [join(root, 'sub', 'compose.yml'), join(root, file)])
+      assert.deepEqual(stack.files, [], file)
+    }
+  })
+
+  test('drops a working dir that leads outside, existing or not', async () => {
+    for (const dir of ['out', 'out/missing', 'dangling']) {
+      assert.equal(await stackFor(join(root, dir), []), undefined, dir)
+    }
+  })
+
+  test('accepts links that stay inside the worktree', async () => {
+    const file = join(root, 'in', 'compose.yml')
+    const stack = await stackFor(join(root, 'in'), [file])
+    assert.deepEqual([stack.files, stack.workdir], [[file], join(root, 'in')])
+  })
+
+  test('accepts a worktree that is itself behind a symlink', async () => {
+    const alias = join(base, 'alias')
+    const file = join(alias, 'sub', 'compose.yml')
+    const stack = await stackFor(join(alias, 'sub'), [file], alias)
+    assert.deepEqual([stack.files, stack.workdir], [[file], join(alias, 'sub')])
+  })
+
+  test('keeps missing files and directories that stay inside', async () => {
+    const dir = join(root, 'deleted')
+    const stack = await stackFor(dir, [join(dir, 'compose.yml')])
+    assert.deepEqual([stack.files, stack.workdir], [[join(dir, 'compose.yml')], dir])
   })
 })

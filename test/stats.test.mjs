@@ -22,8 +22,8 @@ describe('parseBytes', () => {
     }
   })
 
-  test('returns null for a unit that names an Object prototype member', { todo: 'bug: parseBytes("1constructor") returns NaN (UNITS lookup reaches the prototype)' }, () => {
-    assert.equal(parseBytes('1constructor'), null)
+  test('returns null for a unit that names an Object prototype member', () => {
+    for (const text of ['1constructor', '1toString', '1__proto__', '1valueOf']) assert.equal(parseBytes(text), null, text)
   })
 })
 
