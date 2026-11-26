@@ -59,7 +59,8 @@ const DESKTOP_PLUGIN = findBin('docker-desktop', [
 ])
 // Last-resort names keep error messages meaningful (ENOENT) when a binary is not installed.
 const DOCKER = findBin('docker') ?? join(EXTRA_BIN_DIRS[0], 'docker')
-const ORCA = findBin('orca', [ORCA_BIN_DIR]) ?? join(ORCA_BIN_DIR, 'orca')
+// On Linux the Orca CLI is `orca-ide`: `orca` there is usually the GNOME screen reader.
+const ORCA = findBin('orca-ide', [join(homedir(), '.local', 'bin')]) ?? findBin('orca', [ORCA_BIN_DIR]) ?? join(ORCA_BIN_DIR, 'orca')
 // colima shells out to limactl/docker, so child processes need the Homebrew dirs on PATH.
 // An inherited DOCKER_HOST is dropped: it overrides Docker contexts and would silently pick another engine.
 const CHILD_ENV = (() => {
@@ -1267,7 +1268,8 @@ export const shellQuote = (text) => `'${String(text).replaceAll("'", "'\\''")}'`
 // `--context` is explicit, so the user's own DOCKER_HOST/DOCKER_CONTEXT cannot redirect the shell to another engine.
 export function buildShellCommand(dockerBin, context, id) {
   if (!CONTAINER_ID_RE.test(id)) throw new Error('Invalid container id.')
-  return `${shellQuote(dockerBin)}${context ? ` --context ${shellQuote(context)}` : ''} exec -it ${shellQuote(id)} sh`
+  // bash when the image has it, else sh (images like alpine ship only sh).
+  return `${shellQuote(dockerBin)}${context ? ` --context ${shellQuote(context)}` : ''} exec -it ${shellQuote(id)} sh -c ${shellQuote('command -v bash >/dev/null && exec bash || exec sh')}`
 }
 
 const NOT_OWNED = { ok: false, message: 'Container is not in the shown scope.' }
@@ -1372,10 +1374,13 @@ export default async function activate(orca) {
   handle('colima.shell', async (input) => {
     const { worktree, kind, target } = await ownedContainer(orca, String(input?.id ?? ''), input?.scope, true)
     if (!target) return NOT_OWNED
-    if (kind !== 'worktree') return { ok: false, message: 'A shell needs an Orca worktree: open this container from its worktree.' }
     if (!CONTAINER_ID_RE.test(target.id)) return { ok: false, message: 'Unexpected container id.' }
     if (target.state !== 'running') return { ok: false, message: 'A shell needs a running container.' }
-    const res = await orcaJson(['terminal', 'create', '--worktree', `path:${worktree}`, '--title', `sh ${target.name}`,
+    // A terminal tab must belong to a worktree: containers outside one open in the focused workspace.
+    // Not `--worktree active`: the CLI resolves that from its cwd, which for the worker is no worktree.
+    const where = kind === 'worktree' && worktree ? { path: worktree } : await resolveActiveWorktree(orca)
+    if (!where.path) return { ok: false, message: `A shell opens in the focused workspace: ${where.error}` }
+    const res = await orcaJson(['terminal', 'create', '--worktree', `path:${where.path}`, '--title', `sh ${target.name}`,
       '--command', buildShellCommand(DOCKER, activeContext, target.id), '--focus'])
     return res.ok ? { ok: true } : { ok: false, message: `orca CLI failed: ${String(res.error?.message ?? '').slice(0, 200)}` }
   })

@@ -420,7 +420,7 @@
         <div class="row">
           <button data-a="logs" data-t="${esc(c.id)}">logs</button>
           <button data-a="${c.state === 'running' ? 'stop' : 'start'}" data-t="${esc(c.id)}">${c.state === 'running' ? 'stop' : 'start'}</button>
-          ${pinned && pinned.scope.kind !== 'worktree' ? '' : `<button data-a="shell" data-t="${esc(c.id)}">shell</button>`}
+          <button data-a="shell" data-t="${esc(c.id)}">shell</button>
         </div>
       </div>`
   }
@@ -481,7 +481,7 @@
     const live = ['running', 'paused', 'restarting'].includes(c.state)
     // Inspect actions (logs, shell) first, then lifecycle actions.
     const items = [{ id: 'logs', label: 'Logs' }]
-    if (c.scopeKind === 'worktree') items.push({ id: 'shell', label: 'Shell', disabled: c.busy || c.state !== 'running' })
+    items.push({ id: 'shell', label: 'Shell', disabled: c.busy || c.state !== 'running' })
     items.push({ sep: true })
     items.push(live ? { id: 'stop', label: 'Stop', disabled: c.busy } : { id: 'start', label: 'Start', disabled: c.busy })
     items.push({ id: 'restart', label: 'Restart', disabled: c.busy })
