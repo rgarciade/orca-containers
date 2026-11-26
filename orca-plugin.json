@@ -22,23 +22,28 @@
   "capabilities": [{ "kind": "notifications:show" }, { "kind": "workspace:read" }, { "kind": "storage:own" }],
   "cover": {
     "path": "images/cover.png",
-    "alt": "Containers panel in Orca's sidebar: the All view grouping containers by Compose project, and a project's detail view with ports, CPU and memory"
+    "alt": "Containers panel in Orca's sidebar: engine card and All view, with container cards showing ports, CPU and memory"
   },
   "screenshots": [
     {
       "path": "images/screenshot-all.png",
-      "alt": "The All view: containers grouped by Compose project and individual containers, with status and published ports",
-      "caption": "Every container on the engine, grouped by project"
+      "alt": "Engine card with the Switch engine list and its running and stopped counts, above the All view grouped by project and worktree",
+      "caption": "Switch engines and see what runs"
     },
     {
       "path": "images/screenshot-ports.png",
-      "alt": "The All view with running containers and their port chips, host port to container port, with internal-only ports dashed",
-      "caption": "Know which port goes where"
+      "alt": "Individual containers with published ports, dashed internal-only ports, and exit 1 and restarting markers",
+      "caption": "Ports and health at a glance"
     },
     {
       "path": "images/screenshot-detail.png",
-      "alt": "A Compose project's detail view with Up, Restart and Down, and live CPU, memory and ports for each container",
+      "alt": "A worktree's detail view with Up, Restart and Down for its Compose stack, and ports, CPU, memory, logs, stop and shell per container",
       "caption": "Run a Compose project from the sidebar"
+    },
+    {
+      "path": "images/screenshot-logs.png",
+      "alt": "Live logs with Expand and Open in terminal buttons, a history search for 404, and docker logs in an Orca terminal",
+      "caption": "Live logs, history search and Open in terminal"
     }
   ]
 }
