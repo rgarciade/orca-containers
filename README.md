@@ -16,7 +16,7 @@ or any other Docker context.
 | **Containers** | Two views, remembered between sessions. *This worktree* follows the focused workspace: containers whose Compose working directory is inside it, with status, CPU and memory usage, and start/stop. *All* is an overview tree (Orca project, worktree, containers, then other Compose projects and individual containers) with status and ports; click a worktree, a Compose project or one of its containers to open its detail view, and use **← All** to go back. Right-click a worktree, Compose project or container (or use the **⋯** button, Shift+F10 or the context-menu key) for a menu with details, logs, start, stop, restart, down, up and shell. Containers that are unhealthy, restarting, starting their healthcheck or stopped with an abnormal exit code (other than 0, 130 and 143) are labelled. A collapsed group counts its unhealthy, restarting and abnormally exited containers (exit 137 and `health: starting` are not counted). |
 | **Shell** | Open a shell (bash when the image has it, else sh) in any running container, as a new terminal tab in Orca: in the container's worktree, or in the focused workspace for containers outside Orca worktrees. |
 | **Ports** | Published ports as chips (`host port → container port`); internal-only ports are shown dashed. Click a chip to copy `host:port`. |
-| **Logs** | *Live* mode follows the container's output with timestamps. *History* mode pages back through older lines and searches the whole log (plain text, optional case sensitivity), with a jump to the context around any match. **Expand** fills the panel with the viewer (**Collapse** or Escape goes back). Drag the bar under the log, or focus it and use the arrow keys, to change its height (remembered; Enter or double-click resets it). **Open in terminal** opens a new Orca terminal tab with the last 200 lines, following unless the container is stopped, in the same worktree as **Shell** would use. That terminal is yours: the plugin never closes it. |
+| **Logs** | The **logs** button of a container opens a log viewer inside its card and scrolls to it; press it again, or **close**, to close it. Up to 3 viewers can be open, each on its own; a fourth closes the oldest and says so. They all close when you change workspace, view, scope or engine, and one closes when its container leaves the list. *Live* mode follows the container's output with timestamps. *History* mode pages back through older lines and searches the whole log (plain text, optional case sensitivity), with a jump to the context around any match. **Expand** fills the panel with that viewer (**Collapse** or Escape goes back). Drag the bar under the log, or focus it and use the arrow keys, to change its height (one height for all viewers, remembered; Enter or double-click resets it). **Open in terminal** opens a new Orca terminal tab with the last 200 lines, following unless the container is stopped, in the same worktree as **Shell** would use. That terminal is yours: the plugin never closes it. |
 
 The panel follows workspace switches: when you move to another worktree it shows that
 worktree's stacks and containers.
@@ -65,7 +65,7 @@ for the shell and log terminals and the log watchdog, which only receive validat
 and quoted paths. Container actions are limited to the containers
 of the scope the panel is acting on (the active worktree, or a worktree, Compose project or container
 chosen in the *All* view), and the worker checks that membership on every request. Log processes are
-stopped when you close the log view, about 15 seconds after the panel closes, and when the
+stopped when you close their log viewer, about 15 seconds after the panel closes, and when the
 worker exits, even if it is killed abruptly.
 
 ## Files
@@ -80,7 +80,7 @@ worker exits, even if it is killed abruptly.
   - `overview.mjs`, `stats.mjs`: the All tree, CPU and memory.
   - `terminal.mjs`, `shell.mjs`: the shell and log terminal tabs and their command lines.
   - `prefs.mjs`: the remembered log height.
-  - `logs/`: `process.mjs` (log processes and watchdog), `follow.mjs`, `history.mjs`, `search.mjs`, `text.mjs`.
+  - `logs/`: `process.mjs` (log processes and watchdog), `follow.mjs`, `history.mjs`, `search.mjs`, `tokens.mjs`, `text.mjs`.
 - `panel/index.html`: the sidebar panel.
 - `test/`: unit tests for the worker's logic.
 
