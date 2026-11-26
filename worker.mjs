@@ -291,6 +291,24 @@ function parseLabels(text) {
   return labels
 }
 
+// Exit codes of an ordinary stop: success, SIGINT and SIGTERM.
+const NORMAL_EXIT_CODES = new Set([0, 130, 143])
+
+// Pure. What deserves a marker, from the State and Status columns of `docker ps`:
+// { kind: 'unhealthy' | 'starting' | 'restarting' } or { kind: 'exit', code }; null otherwise,
+// including any Status wording that is not recognised.
+export function containerMarker(state, status) {
+  const text = String(status ?? '')
+  if (state === 'restarting') return { kind: 'restarting' }
+  if (state === 'running') {
+    if (text.endsWith('(unhealthy)')) return { kind: 'unhealthy' }
+    return text.endsWith('(health: starting)') ? { kind: 'starting' } : null
+  }
+  const exit = state === 'exited' ? text.match(/^Exited \((\d+)\)/) : null
+  if (!exit || NORMAL_EXIT_CODES.has(Number(exit[1]))) return null
+  return { kind: 'exit', code: Number(exit[1]) }
+}
+
 async function listContainers() {
   const res = await run(DOCKER, dockerArgs(['ps', '-a', '--format', '{{json .}}']))
   if (!res.ok) return { error: res.stderr.slice(0, 500), containers: [] }
@@ -299,6 +317,7 @@ async function listContainers() {
     const labels = parseLabels(c.Labels)
     return {
       id: c.ID, name: c.Names, image: c.Image, state: c.State, status: c.Status, ports: c.Ports,
+      marker: containerMarker(c.State, c.Status),
       service: labels['com.docker.compose.service'] ?? null,
       workdir: labels['com.docker.compose.project.working_dir'] ?? null,
       project: labels['com.docker.compose.project'] ?? null,
@@ -534,7 +553,7 @@ async function ownedContainer(orca, id, scope, fresh = false) {
 // ---- Overview tree ----
 const byRunningThenName = (a, b) => (b.running > 0) - (a.running > 0) || String(a.name).localeCompare(String(b.name))
 const tally = (items) => ({ running: items.filter((c) => c.state === 'running').length, total: items.length })
-const slimContainer = (c) => ({ id: c.id, name: c.name, image: c.image, state: c.state, status: c.status, ports: c.ports, project: c.project })
+const slimContainer = (c) => ({ id: c.id, name: c.name, image: c.image, state: c.state, status: c.status, marker: c.marker, ports: c.ports, project: c.project })
 const sortContainers = (items) => items.map(slimContainer).sort((a, b) => (b.state === 'running') - (a.state === 'running') || a.name.localeCompare(b.name))
 
 // Pure. Orca project > worktree > containers, then "other" compose projects and individual containers.

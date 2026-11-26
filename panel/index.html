@@ -101,6 +101,9 @@
   /* Drawn box instead of the ■ glyph, which renders much smaller than ▷ at this font size. */
   .st .sq { display: block; width: 9px; height: 9px; border-radius: 2px; background: currentColor; }
   .st.running { color: #3fb950; } .st.stopped { color: #f85149; opacity: .6; } .st.other { color: #d29922; }
+  .flag { display: inline-block; font-size: 10px; font-weight: 600; line-height: 1.4; white-space: nowrap; border: 1px solid currentColor; border-radius: 10px; padding: 0 6px; }
+  .flag.bad { color: #f85149; } .flag.warn { color: #d29922; }
+  .flag.quiet { color: var(--orca-muted-foreground); font-weight: 400; border-color: var(--orca-border); }
   .crow .img { font-size: 11px; color: var(--orca-muted-foreground); word-break: break-all; }
   .crow .ports { margin-top: 4px; }
   .crow-main .more, .tg-head .more { margin-left: 4px; padding: 0 6px; border-color: transparent; background: transparent; line-height: 1.2; opacity: 0; flex: none; }
@@ -411,9 +414,25 @@
     $('compose').innerHTML = stacks.length ? `<div class="card-title">Compose</div>${stacks.map(renderStack).join('')}` : ''
   }
 
+  const MARKERS = {
+    unhealthy: { cls: 'bad', text: 'unhealthy', title: 'The healthcheck is failing' },
+    restarting: { cls: 'warn', text: 'restarting', title: 'The engine is restarting this container' },
+    starting: { cls: 'quiet', text: 'health: starting', title: 'The healthcheck has not passed yet' }
+  }
+  function markerHtml(marker) {
+    if (!marker) return ''
+    const m = marker.kind === 'exit'
+      // 137 is quiet: stopping the engine, or a container that ignores SIGTERM, ends this way too.
+      ? { cls: marker.code === 137 ? 'quiet' : 'bad', text: `exit ${marker.code}`, title: marker.code === 137
+          ? 'Exit code 137 usually means SIGKILL: a forced stop, or possibly running out of memory.'
+          : `Stopped with exit code ${marker.code}` }
+      : MARKERS[marker.kind]
+    return m ? `<span class="flag ${m.cls}" title="${esc(m.title)}">${esc(m.text)}</span>` : ''
+  }
+
   function renderContainer(c) {
     return `<div class="item" data-cid="${esc(c.id)}">
-        <div class="name"><span class="${esc(c.state)}">&#9679;</span> ${esc(c.name)}</div>
+        <div class="name"><span class="${esc(c.state)}">&#9679;</span> ${esc(c.name)} ${markerHtml(c.marker)}</div>
         <div class="sub">${esc(c.status)}</div>
         ${renderPorts(c.ports)}
         ${c.state === 'running' ? `<div class="stats" data-id="${esc(c.id)}">${statsHtml(c.id)}</div>` : ''}
@@ -534,7 +553,7 @@
     const ck = `k:${c.id}`
     const focusable = ctx && !open ? ' tabindex="0"' : ''
     return `<div class="crow${open ? ' openable' : ''}" style="--d:${depth}"${openAttrs(open, open ? c.id : null)}${focusable}${ctx ? ` data-ctx="${esc(ck)}"` : ''}>
-        <div class="crow-main">${stIcon(c.state)}<span class="name">${esc(c.name)}</span><span class="img">${esc(c.image)}</span>${opHtml(rowOps.get(c.id))}${ctx ? moreBtn(ck, c.name) : ''}</div>
+        <div class="crow-main">${stIcon(c.state)}<span class="name">${esc(c.name)}</span>${markerHtml(c.marker)}<span class="img">${esc(c.image)}</span>${opHtml(rowOps.get(c.id))}${ctx ? moreBtn(ck, c.name) : ''}</div>
         <div class="sub">${esc(c.status)}</div>
         ${renderPorts(c.ports)}
       </div>`
