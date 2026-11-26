@@ -88,6 +88,16 @@ describe('buildOverview', () => {
     assert.equal('workdir' in out.individual.containers[0], false)
   })
 
+  test('keeps the container marker in every group', () => {
+    const marker = { kind: 'exit', code: 137 }
+    const out = buildOverview([
+      { ...c('inTree', '/r/app', 'a'), marker }, { ...c('inOther', '/srv/x', 'x'), marker }, { ...c('solo', null), marker }
+    ], worktrees, repos)
+    assert.deepEqual(out.projects[0].worktrees[0].containers[0].marker, marker)
+    assert.deepEqual(out.other.projects[0].containers[0].marker, marker)
+    assert.deepEqual(out.individual.containers[0].marker, marker)
+  })
+
   test('ignores archived worktrees and labels unknown repos', () => {
     const wts = [{ path: '/r/gone', isArchived: true }, { path: '/r/live', repoId: 'nope' }]
     const out = buildOverview([c('old', '/r/gone', 'old'), c('new', '/r/live', 'new')], wts, undefined)
