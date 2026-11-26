@@ -6,7 +6,8 @@ import { execFileSync } from 'node:child_process'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { buildShellCommand, EngineError, guardEngine, shellQuote } from '../worker.mjs'
+import { EngineError, guardEngine } from '../lib/docker.mjs'
+import { buildShellCommand, shellQuote } from '../lib/shell.mjs'
 
 // The words /sh sees in `command`, NUL-separated so newlines inside a word survive.
 // It runs in a throwaway directory with no usable PATH, so a quoting regression cannot touch the repository

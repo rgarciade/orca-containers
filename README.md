@@ -71,7 +71,14 @@ worker exits, even if it is killed abruptly.
 ## Files
 
 - `orca-plugin.json`: manifest.
-- `worker.mjs`: runs engine, Docker and Orca CLI commands and answers the panel.
+- `worker.mjs`: worker entry; `activate` and the panel handler registration.
+- `lib/`: the worker's modules, which run the engine, Docker and Orca CLI commands.
+  - `exec.mjs` (binary lookup, child environment), `docker.mjs` (selected engine and `--context`), `containers.mjs` (`docker ps`).
+  - `engines/`: `context.mjs` (context parsing and engine detection), `control.mjs` (engine CLI commands), `vm.mjs` (status, start, stop, restart), `others.mjs` (the Switch engine list).
+  - `worktree.mjs`, `scope.mjs`: the focused worktree, scope validation and container ownership.
+  - `compose-stacks.mjs`, `compose.mjs`: stack discovery and Compose actions.
+  - `overview.mjs`, `stats.mjs`, `shell.mjs`: the All tree, CPU and memory, the shell command.
+  - `logs/`: `process.mjs` (log processes and watchdog), `follow.mjs`, `history.mjs`, `search.mjs`, `text.mjs`.
 - `panel/index.html`: the sidebar panel.
 - `test/`: unit tests for the worker's logic.
 

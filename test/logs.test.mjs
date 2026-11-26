@@ -1,7 +1,7 @@
 // Log timestamps, history paging and search.
 import { describe, test } from 'node:test'
 import assert from 'node:assert/strict'
-import { compareTs, createSearchCollector, filterOlder, isRfc3339, lineMatcher, selectOlder } from '../worker.mjs'
+import { compareTs, createSearchCollector, filterOlder, isRfc3339, lineMatcher, selectOlder } from '../lib/logs/text.mjs'
 
 const ts = (s) => `2024-05-01T10:00:0${s}Z`
 const line = (s, text) => `${ts(s)} ${text}`

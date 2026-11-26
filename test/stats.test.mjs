@@ -1,7 +1,8 @@
 // `docker stats` parsing and the log output chunker (with mocked timers).
 import { afterEach, beforeEach, describe, mock, test } from 'node:test'
 import assert from 'node:assert/strict'
-import { createChunker, parseBytes, parseStatsLine } from '../worker.mjs'
+import { createChunker } from '../lib/logs/text.mjs'
+import { parseBytes, parseStatsLine } from '../lib/stats.mjs'
 
 describe('parseBytes', () => {
   test('reads decimal and binary units', () => {

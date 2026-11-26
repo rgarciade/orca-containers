@@ -1,7 +1,8 @@
 // Worktree matching and the "All" tree.
 import { describe, test } from 'node:test'
 import assert from 'node:assert/strict'
-import { buildOverview, matchWorktree } from '../worker.mjs'
+import { buildOverview } from '../lib/overview.mjs'
+import { matchWorktree } from '../lib/worktree.mjs'
 
 const wt = (path, branch, displayName, extra = {}) => ({ path, branch, displayName, ...extra })
 

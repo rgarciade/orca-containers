@@ -1,7 +1,7 @@
 // Container markers derived from the State/Status columns of `docker ps`.
 import { describe, test } from 'node:test'
 import assert from 'node:assert/strict'
-import { containerMarker } from '../worker.mjs'
+import { containerMarker } from '../lib/containers.mjs'
 
 describe('containerMarker', () => {
   test('reports the health of a running container', () => {

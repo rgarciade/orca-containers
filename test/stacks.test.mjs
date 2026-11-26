@@ -5,7 +5,7 @@ import assert from 'node:assert/strict'
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { composeScopeStacks, discoverStacks } from '../worker.mjs'
+import { composeScopeStacks, discoverStacks } from '../lib/compose-stacks.mjs'
 
 const BAD_PROJECTS = ['-f', '--project-directory=/', '../up', 'Web', 'a b', 'a;rm', 'a/b', '_x', '', null, undefined]
 
