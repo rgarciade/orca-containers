@@ -42,8 +42,8 @@
     },
     {
       "path": "images/screenshot-logs.png",
-      "alt": "A container's live logs with timestamps, and a history search for 404 with the matches highlighted",
-      "caption": "Live logs and history search"
+      "alt": "Live logs with Expand and Open in terminal buttons, a history search for 404, and docker logs in an Orca terminal",
+      "caption": "Live logs, history search and Open in terminal"
     }
   ]
 }
