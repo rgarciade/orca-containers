@@ -2,10 +2,10 @@
 // The panel polls `colima.state`; all process execution happens here.
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { execFile, spawn } from 'node:child_process'
-import { existsSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync, readlinkSync, realpathSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { readdir } from 'node:fs/promises'
 import { cpus, homedir, totalmem, tmpdir } from 'node:os'
-import { basename, delimiter, join, relative, resolve } from 'node:path'
+import { basename, delimiter, dirname, join, relative, resolve } from 'node:path'
 
 const LOG_TAIL_LINES = 200
 const LOG_OLDER_LINES = 500
@@ -199,18 +199,107 @@ function ensureEngine(orca) {
   return enginePromise
 }
 
-// A unix socket that does not exist means the engine is not running; other endpoints are unknown (null).
-const endpointReachable = (endpoint) => (endpoint.startsWith('unix://') ? existsSync(endpoint.slice('unix://'.length)) : null)
+// ---- Other engines (the panel's engine switcher) ----
+// Only local engines are probed: contacting a remote one without being asked is never acceptable.
+const OTHERS_TTL_MS = 30000
+const OTHERS_TIMEOUT_MS = 4000
+const SYMLINK_MAX_HOPS = 16
+let othersCache = null // { key: selection, at, promise }
 
-const engineList = () => {
-  const list = contexts.map((c) => ({ name: c.name, label: detectAdapter(c).label, current: c.name === activeContext, reachable: endpointReachable(c.endpoint) }))
-  if (contextMissing && activeContext) list.unshift({ name: activeContext, label: activeAdapter().label, current: true, reachable: false, missing: true })
-  return list
+// Pure. { type: 'unix' | 'npipe', path } for an endpoint on this machine, else null.
+export function localEndpoint(endpoint) {
+  const m = /^(?:unix:\/\/(\/.+)|npipe:\/\/(\/\/\.\/pipe\/.+))$/.exec(String(endpoint ?? ''))
+  if (!m) return null
+  return m[1] ? { type: 'unix', path: m[1] } : { type: 'npipe', path: m[2] }
 }
 
-function run(bin, args, timeout = 20000) {
+// Where a socket path really leads. Followed link by link, so a link to a stopped engine's socket (which
+// realpath rejects) still resolves.
+function socketTarget(path) {
+  let current = path
+  for (let hop = 0; hop < SYMLINK_MAX_HOPS; hop++) {
+    try { current = join(realpathSync(dirname(current)), basename(current)) } catch { /* no such directory */ }
+    try { current = resolve(dirname(current), readlinkSync(current)) } catch { break } // not a link
+  }
+  return current
+}
+
+// Identity of the daemon behind a local endpoint; null for a remote one.
+export function endpointKey(endpoint) {
+  const local = localEndpoint(endpoint)
+  if (!local) return null
+  return local.type === 'unix' ? `unix:${socketTarget(local.path)}` : `npipe:${local.path.toLowerCase()}`
+}
+
+// The contexts to offer besides the selected one: all of them, in list order. The list is the only switcher,
+// so the one thing hidden is a `default` that is just another listed context's daemon.
+export function selectOtherEngines(list, selected) {
+  const all = list ?? []
+  const defaultKey = endpointKey(all.find((c) => c.name === 'default')?.endpoint)
+  const aliased = Boolean(defaultKey) && all.some((c) => c.name !== 'default' && endpointKey(c.endpoint) === defaultKey)
+  return all.filter((c) => c.name !== selected?.name && !(aliased && c.name === 'default'))
+}
+
+// True only when a unix socket is certainly not there; any other stat error is left for docker to report.
+export function socketMissing(endpoint) {
+  const local = localEndpoint(endpoint)
+  if (local?.type !== 'unix') return false
+  try { statSync(local.path) } catch (e) { return e.code === 'ENOENT' || e.code === 'ENOTDIR' }
+  return false
+}
+
+// Pure. Container states -> counts; only `running` counts as running, as in the overview's group tallies.
+export function containerCounts(states) {
+  const running = states.filter((s) => s === 'running').length
+  return { running, stopped: states.length - running }
+}
+
+// Pure. `res` is the result of `docker ps -a --format {{.State}}`, or null when the socket is missing and
+// nothing was run.
+export function otherEngineStatus(res) {
+  if (!res) return { state: 'stopped' }
+  if (!res.ok) return { state: 'unavailable' }
+  return { state: 'running', ...containerCounts(res.stdout.split('\n').map((line) => line.trim()).filter(Boolean)) }
+}
+
+// What a row says before (or without) a docker call; state null = local, waiting for its count.
+export function otherEngineRow(c) {
+  const state = localEndpoint(c.endpoint) ? (socketMissing(c.endpoint) ? 'stopped' : null) : c.endpoint ? 'remote' : 'unavailable'
+  return { name: c.name, label: detectAdapter(c).label, state }
+}
+
+// A vanished selection is not in the list, so every listed context remains a way out.
+function otherContexts() {
+  return selectOtherEngines(contexts, contextMissing ? null : { name: activeContext })
+}
+
+// Deliberately outside dockerArgs: these calls target engines other than the selected one, and only read.
+async function probeOtherEngine(c) {
+  const res = socketMissing(c.endpoint) ? null : await run(DOCKER, ['--context', c.name, 'ps', '-a', '--format', '{{.State}}'], OTHERS_TIMEOUT_MS, 'SIGKILL')
+  return otherEngineStatus(res)
+}
+
+// Contexts sharing a local socket share one probe; remote ones are never probed.
+export function probeOncePerDaemon(list, probe) {
+  const byKey = new Map()
+  return Promise.all(list.filter((c) => localEndpoint(c.endpoint)).map(async (c) => {
+    const key = endpointKey(c.endpoint)
+    if (!byKey.has(key)) byKey.set(key, probe(c))
+    return { name: c.name, ...await byKey.get(key) }
+  }))
+}
+
+function otherEngines() {
+  const key = `${contextMissing}\0${activeContext}`
+  if (othersCache && othersCache.key === key && Date.now() - othersCache.at < OTHERS_TTL_MS) return othersCache.promise
+  const promise = probeOncePerDaemon(otherContexts(), probeOtherEngine)
+  othersCache = { key, at: Date.now(), promise }
+  return promise
+}
+
+function run(bin, args, timeout = 20000, killSignal = 'SIGTERM') {
   return new Promise((resolve) => {
-    execFile(bin, args, { cwd: '/', env: CHILD_ENV, maxBuffer: 8 * 1024 * 1024, timeout },
+    execFile(bin, args, { cwd: '/', env: CHILD_ENV, maxBuffer: 8 * 1024 * 1024, timeout, killSignal },
       (error, stdout, stderr) => resolve({ ok: !error, stdout, stderr: stderr || String(error ?? '') }))
   })
 }
@@ -324,6 +413,9 @@ async function listContainers() {
       configFiles: String(labels['com.docker.compose.project.config_files'] ?? '').split(',').filter(Boolean)
     }
   })
+  // The whole engine's counts ride along on the answer of any request that listed its containers.
+  const scope = engineScope.getStore()
+  if (scope) scope.counts = containerCounts(containers.map((c) => c.state))
   return { error: null, containers }
 }
 
@@ -707,7 +799,7 @@ async function vmStatus() {
 // Everything the Engine card needs besides the status itself.
 function engineInfo() {
   const ad = activeAdapter()
-  return { engine: { name: activeContext, kind: ad.kind, label: ad.label, missing: contextMissing }, engines: engineList(), controls: engineControls(ad) }
+  return { engine: { name: activeContext, kind: ad.kind, label: ad.label, missing: contextMissing }, engines: otherContexts().map(otherEngineRow), controls: engineControls(ad) }
 }
 
 // Host limits for the VM size; the panel shows them, the worker enforces them.
@@ -1304,8 +1396,9 @@ export default async function activate(orca) {
     if (name === 'engine.set') return fn(input, ctx)
     const engine = activeContext
     try {
-      const out = await engineScope.run({ engine }, () => fn(input, ctx))
-      return out && typeof out === 'object' && !Array.isArray(out) ? { ...out, engineName: engine } : out
+      const store = { engine }
+      const out = await engineScope.run(store, () => fn(input, ctx))
+      return out && typeof out === 'object' && !Array.isArray(out) ? { ...out, engineName: engine, engineCounts: store.counts ?? null } : out
     } catch (e) {
       if (!(e instanceof EngineError)) throw e
       // Shaped so every panel consumer (state, overview, actions, VM calls) can read it as a failure.
@@ -1354,6 +1447,12 @@ export default async function activate(orca) {
     return { ...status, ...engineInfo(), prefs, limits: hostLimits() }
   })
 
+  // Separate from colima.vm so that a hung engine never delays the panel's normal state.
+  handle('colima.others', async () => {
+    await loadContexts()
+    return { engines: await otherEngines() }
+  })
+
   // Switches the engine. Only a context from the live list is accepted; everything bound to the old engine is dropped.
   handle('engine.set', async (input) => {
     await loadContexts(true)
@@ -1366,6 +1465,7 @@ export default async function activate(orca) {
     activeContext = entry.name
     activeSnapshot = entry
     contextMissing = false
+    othersCache = null
     try { await orca.host.call('storage.set', { key: ENGINE_KEY, value: entry.name }) } catch { /* best-effort */ }
     return { ok: true, name: entry.name }
   })
