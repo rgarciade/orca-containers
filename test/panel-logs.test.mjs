@@ -247,3 +247,51 @@ describe('Open in terminal', () => {
     assert.match(p.$('status').textContent, /not in the shown scope/)
   })
 })
+
+describe('status line', () => {
+  // A click on a container row button.
+  const press = (p, a) => {
+    const button = { id: '', dataset: { a, t: ID }, disabled: false }
+    return p.emit('click', { id: '', closest: (sel) => (sel === 'button[data-a]' ? button : null) })
+  }
+
+  test('shows no progress text once the logs are open', async () => {
+    const p = await boot()
+    await press(p, 'logs')
+    assert.equal(p.$('logs-wrap').hidden, false)
+    assert.equal(p.$('status').textContent, '')
+  })
+
+  test('still shows why the logs could not be followed', async () => {
+    const p = await boot({ 'colima.logs.follow': () => ({ ok: false, message: 'Container is not in the shown scope.' }) })
+    await press(p, 'logs')
+    assert.match(p.$('status').textContent, /not in the shown scope/)
+  })
+
+  test('says when the context could only be read in part', async () => {
+    const p = await boot({ 'colima.logs.context': () => ({ ok: true, lines: [], message: 'Context may be incomplete.' }) })
+    await p.open()
+    await p.run("openContext('2024-05-01T10:00:00Z')")
+    assert.match(p.$('status').textContent, /incomplete/)
+  })
+
+  test('drops a success message after a while but keeps a failure', async () => {
+    let ok = true
+    const p = await boot({ 'colima.action': () => ({ ok, message: 'boom' }) })
+    await press(p, 'restart')
+    assert.equal(p.$('status').textContent, 'restart: done')
+    await p.fire(3000)
+    assert.equal(p.$('status').textContent, '')
+    ok = false
+    await press(p, 'restart')
+    await p.fire(3000)
+    assert.equal(p.$('status').textContent, 'restart failed: boom')
+  })
+
+  test('drops the progress of group operations forgotten on an engine switch', async () => {
+    const p = await boot({ 'engine.set': () => ({ ok: true }) })
+    await p.run("groupOps.set('k', { name: 'web', action: 'stop', pending: new Set(['p:web']), errors: [] }); setStatus('web: stop...')")
+    await p.run("switchEngine('orbstack')")
+    assert.equal(p.$('status').textContent, '')
+  })
+})
