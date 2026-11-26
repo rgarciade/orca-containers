@@ -40,21 +40,22 @@ describe('shellQuote', () => {
 describe('buildShellCommand', () => {
   const ID = '0123456789ab'
   const BIN = '/Applications/My Apps/docker'
+  const SHELL = 'command -v bash >/dev/null && exec bash || exec sh'
 
   test('targets the context explicitly', () => {
-    assert.deepEqual(shellWords(buildShellCommand(BIN, 'colima', ID)), [BIN, '--context', 'colima', 'exec', '-it', ID, 'sh'])
+    assert.deepEqual(shellWords(buildShellCommand(BIN, 'colima', ID)), [BIN, '--context', 'colima', 'exec', '-it', ID, 'sh', '-c', SHELL])
   })
 
   test('omits --context when there is none', () => {
     for (const context of [null, undefined, '']) {
-      assert.deepEqual(shellWords(buildShellCommand(BIN, context, ID)), [BIN, 'exec', '-it', ID, 'sh'])
+      assert.deepEqual(shellWords(buildShellCommand(BIN, context, ID)), [BIN, 'exec', '-it', ID, 'sh', '-c', SHELL])
     }
   })
 
   test('keeps a hostile binary path and context name literal', () => {
     const bin = "/tmp/x'; echo pwned; '/docker"
     const context = '$(echo pwned) --privileged'
-    assert.deepEqual(shellWords(buildShellCommand(bin, context, ID)), [bin, '--context', context, 'exec', '-it', ID, 'sh'])
+    assert.deepEqual(shellWords(buildShellCommand(bin, context, ID)), [bin, '--context', context, 'exec', '-it', ID, 'sh', '-c', SHELL])
   })
 
   test('accepts a full 64-character id', () => {

@@ -60,7 +60,7 @@ const DESKTOP_PLUGIN = findBin('docker-desktop', [
 // Last-resort names keep error messages meaningful (ENOENT) when a binary is not installed.
 const DOCKER = findBin('docker') ?? join(EXTRA_BIN_DIRS[0], 'docker')
 // On Linux the Orca CLI is `orca-ide`: `orca` there is usually the GNOME screen reader.
-const ORCA = findBin('orca-ide', [join(homedir(), '.local', 'bin')]) ?? findBin('orca', [ORCA_BIN_DIR]) ?? join(ORCA_BIN_DIR, 'orca')
+const ORCA = (process.platform === 'linux' ? findBin('orca-ide', [join(homedir(), '.local', 'bin')]) : null) ?? findBin('orca', [ORCA_BIN_DIR]) ?? join(ORCA_BIN_DIR, 'orca')
 // colima shells out to limactl/docker, so child processes need the Homebrew dirs on PATH.
 // An inherited DOCKER_HOST is dropped: it overrides Docker contexts and would silently pick another engine.
 const CHILD_ENV = (() => {
