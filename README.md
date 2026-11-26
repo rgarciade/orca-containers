@@ -28,7 +28,7 @@ worktree's stacks and containers.
 - Orca 1.4.246 or later.
 
 `docker`, `orca` and the engine CLIs (`colima`, `orb`, `podman`, `rdctl`) are looked up on `PATH`,
-then in `/opt/homebrew/bin` and `/usr/local/bin`. Every Docker command runs with
+then in `/opt/homebrew/bin` and `/usr/local/bin` (on Linux the Orca CLI is `orca-ide`). Every Docker command runs with
 `--context <engine>`; an inherited `DOCKER_HOST` is ignored. Only the Colima adapter has been
 tested against a real CLI; the other engine controls follow each vendor's documentation.
 
@@ -59,7 +59,9 @@ terminal. Giving the worktree a unique name in Orca also resolves it.
 
 The worker runs `docker`, the engine CLIs and the `orca` CLI as child processes without a shell, except
 for the terminal commands (shell and log watchdog), which only receive validated container ids
-and quoted paths. Actions are limited to containers of the active worktree. Log processes are
+and quoted paths. Container actions are limited to the containers
+of the scope the panel is acting on (the active worktree, or a worktree, Compose project or container
+chosen in the *All* view), and the worker checks that membership on every request. Log processes are
 stopped when you close the log view, about 15 seconds after the panel closes, and when the
 worker exits, even if it is killed abruptly.
 
