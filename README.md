@@ -67,6 +67,15 @@ worker exits, even if it is killed abruptly.
 - `orca-plugin.json`: manifest.
 - `worker.mjs`: runs engine, Docker and Orca CLI commands and answers the panel.
 - `panel/index.html`: the sidebar panel.
+- `test/`: unit tests for the worker's logic.
+
+## Tests
+
+With Node 22, from the repository root (no dependencies, and no Docker, Orca or Colima needed):
+
+```sh
+node --test
+```
 
 ## Licence
 
