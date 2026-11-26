@@ -23,5 +23,22 @@
   "cover": {
     "path": "images/cover.png",
     "alt": "Containers panel in Orca's sidebar: the All view grouping containers by Compose project, and a project's detail view with ports, CPU and memory"
-  }
+  },
+  "screenshots": [
+    {
+      "path": "images/screenshot-all.png",
+      "alt": "The All view: containers grouped by Compose project and individual containers, with status and published ports",
+      "caption": "Every container on the engine, grouped by project"
+    },
+    {
+      "path": "images/screenshot-ports.png",
+      "alt": "The All view with running containers and their port chips, host port to container port, with internal-only ports dashed",
+      "caption": "Know which port goes where"
+    },
+    {
+      "path": "images/screenshot-detail.png",
+      "alt": "A Compose project's detail view with Up, Restart and Down, and live CPU, memory and ports for each container",
+      "caption": "Run a Compose project from the sidebar"
+    }
+  ]
 }
