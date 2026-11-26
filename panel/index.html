@@ -18,7 +18,7 @@
   .row { display: flex; gap: 8px; margin-top: var(--space-m); flex-wrap: wrap; }
   button { font: inherit; background: var(--orca-secondary); color: var(--orca-secondary-foreground); border: 1px solid var(--orca-border); border-radius: 4px; padding: 3px 10px; cursor: pointer; }
   button:disabled { opacity: .5; cursor: default; }
-  pre { background: var(--orca-card); border: 1px solid var(--orca-border); padding: 8px; max-height: 40vh; overflow: auto; white-space: pre-wrap; word-break: break-all; margin: 4px 0; }
+  pre { background: var(--orca-card); border: 1px solid var(--orca-border); padding: 8px; overflow: auto; white-space: pre-wrap; word-break: break-all; margin: 4px 0; }
   /* Layout: VM and Compose are side-by-side cards (wrapping when narrow); containers are a list below. */
   .top { display: flex; flex-wrap: wrap; gap: var(--space-m); align-items: stretch; }
   .card { flex: 1 1 220px; min-width: 0; background: var(--orca-card, rgba(255, 255, 255, .03)); border: 1px solid var(--orca-border); border-radius: 8px; padding: 12px; }
@@ -62,8 +62,18 @@
   .bar { height: 3px; border-radius: 2px; background: var(--orca-border); margin-top: 3px; width: 33%; min-width: 80px; max-width: 100%; overflow: hidden; }
   .bar > i { display: block; height: 100%; background: #58a6ff; }
   .bar.mem > i { background: #3fb950; }
-  .logs-head { display: flex; align-items: center; gap: var(--space-m); margin-top: var(--space-l); }
-  .logs-head h2 { margin: 0; flex: 1; min-width: 0; word-break: break-all; }
+  .logs-head { display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-s); margin-top: var(--space-l); }
+  .logs-head h2 { margin: 0; flex: 1 1 120px; min-width: 0; word-break: break-all; }
+  #logs { max-height: 40vh; box-sizing: border-box; } /* border-box: a chosen height equals offsetHeight */
+  #logs-resize { display: flex; justify-content: center; align-items: center; height: 10px; cursor: ns-resize; touch-action: none; }
+  #logs-resize::after { content: ''; width: 36px; height: 3px; border-radius: 2px; background: var(--orca-border); }
+  #logs-resize:hover::after, #logs-resize:focus-visible::after { background: var(--orca-ring, #58a6ff); }
+  /* Expanded log viewer: only the status line and the viewer remain, and the log box takes the rest. */
+  body.logs-max { display: flex; flex-direction: column; height: 100vh; box-sizing: border-box; overflow: hidden; }
+  body.logs-max > .top, body.logs-max > #viewbar, body.logs-max > #content, body.logs-max #logs-resize { display: none; }
+  body.logs-max > #logs-wrap:not([hidden]) { display: flex; flex: 1; flex-direction: column; min-height: 0; }
+  body.logs-max .logs-head { margin-top: 0; }
+  body.logs-max #logs { flex: 1; min-height: 0; max-height: none; }
   .ln { min-height: 1.3em; }
   .ln .ts { color: var(--orca-muted-foreground); opacity: .6; margin-right: 8px; user-select: none; }
   #logs-older { text-align: center; margin-bottom: 4px; color: var(--orca-muted-foreground); font-size: 11px; }
@@ -143,6 +153,8 @@
     <h2 id="logs-title"></h2>
     <span id="logs-state"></span>
     <button id="logs-mode">History</button>
+    <button id="logs-expand">Expand</button>
+    <button id="logs-terminal" title="Open these logs in a new Orca terminal">Open in terminal</button>
     <button id="logs-close">close</button>
   </div>
   <div id="logs-search" hidden>
@@ -153,6 +165,7 @@
     <span id="logs-count"></span>
   </div>
   <pre id="logs"><div id="logs-older"></div><div id="logs-lines"></div><div id="logs-results" hidden></div><div id="logs-context" hidden></div></pre>
+  <div id="logs-resize" role="separator" tabindex="0" aria-orientation="horizontal" aria-label="Log height" aria-valuemin="120" aria-valuemax="4000" title="Drag, or use the up and down arrows. Enter or double-click: automatic height"></div>
 </div>
 <script>
   const POLL_MS = 3000
@@ -175,6 +188,17 @@
   let logsOlderBusy = false
   const LOGS_MAX_LINES = 20000
   const SEARCH_DEBOUNCE_MS = 300
+  const LOGS_HEIGHT_MIN = 120 // same limits as the worker's
+  const LOGS_HEIGHT_MAX = 4000
+  const LOGS_HEIGHT_STEP = 40
+  const LOGS_HEIGHT_SAVE_MS = 400 // key repeat must not flood the plugin bridge
+  let logsExpanded = false // the log viewer fills the panel
+  let expandScroll = null // { before, after }: log position around expanding, to undo what the taller box clamped
+  let pageScroll = 0
+  let logsHeight = null // chosen height in px; null: automatic
+  let logsHeightChosen = false // changed here: a late saved value must not override it
+  let logsHeightTimer = null
+  let logsDrag = null // { y, height } at the start of a drag
   const STATS_MS = 5000
   let stats = {} // container id -> latest stats from the worker
   let statsKey = null // workspace context the stats belong to
@@ -188,7 +212,7 @@
   let overview = null // latest colima.overview result
   let modeSeq = 0 // bumped on every view / pin change: stale async results are dropped
   const collapsed = new Set() // group keys collapsed in the tree (panel memory only)
-  const SCOPED = new Set(['colima.state', 'colima.stats', 'colima.compose', 'colima.logs.follow', 'colima.logs.older', 'colima.logs.search', 'colima.logs.context', 'colima.action', 'colima.shell'])
+  const SCOPED = new Set(['colima.state', 'colima.stats', 'colima.compose', 'colima.logs.follow', 'colima.logs.older', 'colima.logs.search', 'colima.logs.context', 'colima.logs.terminal', 'colima.action', 'colima.shell'])
   let followSeq = 0 // ordering token for logs.follow / logs.stop, so a late follow cannot outlive a stop
   const overviewMode = () => view === 'all' && !pinned
   const followsWorkspace = () => view === 'worktree' && !pinned
@@ -935,6 +959,7 @@
 
   function setLogsView(view) {
     logsView = view
+    expandScroll = null
     $('logs-older').hidden = view !== 'tail'
     $('logs-lines').hidden = view !== 'tail'
     $('logs-results').hidden = view !== 'results'
@@ -988,6 +1013,7 @@
 
   function closeLogs() {
     if (!logsId) return
+    setLogsExpanded(false) // every way out of a view or engine passes here
     logsId = null
     logsEpoch++
     logsMode = 'live'
@@ -997,6 +1023,115 @@
     $('logs-wrap').hidden = true
     request('colima.logs.stop', {}).catch(() => {})
   }
+
+  // ---- Log viewer size and terminal ----
+  const logAtBottom = (pre) => pre.scrollHeight - pre.scrollTop - pre.clientHeight < 24
+
+  function applyLogsHeight() {
+    const style = $('logs').style
+    const fixed = !logsExpanded && logsHeight !== null
+    style.height = fixed ? `${logsHeight}px` : ''
+    style.maxHeight = fixed ? 'none' : ''
+    announceLogsHeight()
+  }
+
+  function announceLogsHeight() {
+    $('logs-resize').setAttribute('aria-valuenow', logsHeight ?? $('logs').offsetHeight)
+  }
+
+  // Keeps following the tail, or else the same position.
+  function setLogsHeight(height) {
+    const pre = $('logs')
+    const follow = logAtBottom(pre)
+    const top = pre.scrollTop
+    logsHeight = height === null ? null : Math.round(Math.max(LOGS_HEIGHT_MIN, Math.min(LOGS_HEIGHT_MAX, height)))
+    applyLogsHeight()
+    pre.scrollTop = follow ? pre.scrollHeight : top
+  }
+
+  function saveLogsHeight() {
+    logsHeightChosen = true
+    clearTimeout(logsHeightTimer)
+    logsHeightTimer = setTimeout(() => { request('colima.logs.height', { height: logsHeight }).catch(() => {}) }, LOGS_HEIGHT_SAVE_MS)
+  }
+
+  async function loadLogsHeight() {
+    try {
+      const r = await request('colima.logs.height', {})
+      if (!logsHeightChosen && r && Number.isInteger(r.height)) setLogsHeight(r.height)
+    } catch { /* automatic height */ }
+  }
+
+  function setLogsExpanded(on) {
+    if (on === logsExpanded) return
+    const pre = $('logs')
+    const follow = logAtBottom(pre)
+    const top = pre.scrollTop
+    // Not scrolled while expanded: go back to where the user was, even if the taller box clamped it.
+    const restore = !on && expandScroll && top === expandScroll.after ? expandScroll.before : null
+    if (on) pageScroll = window.scrollY || 0
+    logsExpanded = on
+    document.body.classList.toggle('logs-max', on)
+    $('logs-expand').textContent = on ? 'Collapse' : 'Expand'
+    applyLogsHeight()
+    pre.scrollTop = restore ?? (follow ? pre.scrollHeight : top)
+    expandScroll = on && !follow ? { before: top, after: pre.scrollTop } : null
+    if (!on && window.scrollTo) window.scrollTo(0, pageScroll)
+  }
+
+  // The user's own toggle: focus stays on the button, whose container list may have just been hidden.
+  function toggleLogsExpanded() {
+    setLogsExpanded(!logsExpanded)
+    $('logs-expand').focus({ preventScroll: true })
+  }
+
+  async function openLogsTerminal(button) {
+    if (!logsId) return
+    button.disabled = true
+    setStatus('Opening terminal…')
+    try {
+      const r = await request('colima.logs.terminal', { id: logsId })
+      if (r.ok) setStatus('Logs opened in a new terminal', 3000)
+      else setStatus(r.message ? `Open in terminal failed: ${r.message}` : '', 10000)
+    } catch (err) { setStatus(`Open in terminal failed: ${err.message}`, 10000) }
+    button.disabled = false
+  }
+
+  document.addEventListener('keydown', (e) => {
+    if (e.target.id !== 'logs-resize') return
+    const now = logsHeight ?? $('logs').offsetHeight
+    const next = { ArrowUp: now - LOGS_HEIGHT_STEP, ArrowDown: now + LOGS_HEIGHT_STEP, Home: LOGS_HEIGHT_MIN, Enter: null }[e.key]
+    if (next === undefined) return
+    e.preventDefault()
+    setLogsHeight(next)
+    saveLogsHeight()
+  })
+  document.addEventListener('focusin', (e) => { if (e.target.id === 'logs-resize') announceLogsHeight() })
+  document.addEventListener('dblclick', (e) => { if (e.target.id === 'logs-resize') { setLogsHeight(null); saveLogsHeight() } })
+
+  document.addEventListener('pointerdown', (e) => {
+    if (e.target.id !== 'logs-resize' || e.button !== 0) return
+    e.preventDefault() // no text selection while dragging
+    e.target.focus({ preventScroll: true })
+    if (e.target.setPointerCapture) e.target.setPointerCapture(e.pointerId)
+    logsDrag = { y: e.clientY, height: $('logs').offsetHeight, moved: false }
+  })
+  const endLogsDrag = () => {
+    if (!logsDrag) return
+    const { moved } = logsDrag
+    logsDrag = null
+    if (moved) saveLogsHeight() // a plain click keeps the automatic height
+  }
+  document.addEventListener('pointermove', (e) => {
+    if (!logsDrag) return
+    if (!e.buttons) { endLogsDrag(); return } // released where no event reached us
+    if (e.clientY === logsDrag.y && !logsDrag.moved) return
+    logsDrag.moved = true
+    logsHeightChosen = true
+    setLogsHeight(logsDrag.height + e.clientY - logsDrag.y)
+  })
+  document.addEventListener('pointerup', endLogsDrag)
+  document.addEventListener('pointercancel', endLogsDrag)
 
   const LINE_TS_RE = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})) ?/
 
@@ -1272,13 +1407,25 @@
 
   document.addEventListener('keydown', (e) => {
     if (e.target.id !== 'logs-q') return
-    if (e.key === 'Escape') { e.preventDefault(); clearSearch(); return }
+    if (e.key === 'Escape') {
+      if (logsExpanded && !e.target.value) return // nothing to clear: Escape collapses the viewer
+      e.preventDefault()
+      clearSearch()
+      return
+    }
     if (e.key !== 'Enter') return
     e.preventDefault()
     const q = e.target.value
     const fresh = !searchDone || searchDone.query !== q || searchDone.caseSensitive !== searchCase
     if (fresh || logsView !== 'results') runSearch()
     else gotoHit(hitIdx + (e.shiftKey ? -1 : 1))
+  })
+
+  // Registered after the search box's own Escape, which takes precedence.
+  document.addEventListener('keydown', (e) => {
+    if (!logsExpanded || e.key !== 'Escape' || e.defaultPrevented) return
+    e.preventDefault()
+    toggleLogsExpanded()
   })
 
   window.orca.plugin.on('colima.logs.chunk', (res) => {
@@ -1323,6 +1470,8 @@
     const opener = e.target.closest('[data-open]')
     if (opener) { openScope({ open: opener.dataset.open, v: opener.dataset.v, n: opener.dataset.n, b: opener.dataset.b, cid: opener.dataset.cid }); return }
     if (e.target.id === 'logs-close') { closeLogs(); return }
+    if (e.target.id === 'logs-expand') { toggleLogsExpanded(); return }
+    if (e.target.id === 'logs-terminal') { await openLogsTerminal(e.target); return }
     if (e.target.id === 'logs-load-older') { await loadOlder(); return }
     if (e.target.id === 'logs-mode') { await (logsMode === 'live' ? startHistory() : startLive()); return }
     if (e.target.id === 'logs-case') {
@@ -1730,6 +1879,7 @@
     })
   } catch { /* events unavailable: the watcher keeps polling */ }
   // The remembered view decides what the first poll fetches.
+  loadLogsHeight()
   ;(async () => {
     try {
       const r = await request('colima.view', {})
