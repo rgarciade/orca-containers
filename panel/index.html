@@ -1390,6 +1390,7 @@
       }
       setLogsView('context')
       if (focus) focus.scrollIntoView({ block: 'center' })
+      if (r.message) setStatus(r.message, 10000)
     } catch (err) { if (logsId === id) setStatus(`context failed: ${err.message}`) }
   }
 
@@ -1496,12 +1497,12 @@
     if (a === 'compose') { await composeAction(t, b.dataset.c); return }
     if (a === 'engine') { refocusRow = vm && vm.engine ? vm.engine.name : engineName; await switchEngine(t); return }
     b.disabled = true
-    setStatus(`${a}...`)
+    setStatus(a === 'logs' ? '' : `${a}...`) // the log viewer is its own progress indicator
     try {
       if (a === 'logs') await openLogs(t)
       else {
         const r = await request(a === 'shell' ? 'colima.shell' : 'colima.action', { id: t, action: a })
-        setStatus(r.ok ? `${a}: done` : `${a} failed: ${r.message}`)
+        setStatus(r.ok ? `${a}: done` : `${a} failed: ${r.message}`, r.ok ? 3000 : 0)
       }
     } catch (err) { setStatus(`${a} failed: ${err.message}`) }
     b.disabled = false
@@ -1598,6 +1599,7 @@
     pinned = null
     overview = null
     vm = null
+    for (const op of groupOps.values()) clearGroupProgress(op)
     groupOps.clear()
     rowOps.clear()
     resetDetail() // closes logs, drops state and cancels in-flight refreshes
@@ -1645,7 +1647,7 @@
 
   function pruneStaleOps() {
     const now = Date.now()
-    for (const [k, op] of groupOps) if (now - op.at > OP_STALE_MS) groupOps.delete(k)
+    for (const [k, op] of groupOps) if (now - op.at > OP_STALE_MS) { clearGroupProgress(op); groupOps.delete(k) }
     for (const [k, op] of rowOps) if (now - op.at > OP_STALE_MS) rowOps.delete(k)
   }
 
@@ -1770,6 +1772,11 @@
     settleGroupOp(t.key, op)
     busy = false
     refresh()
+  }
+
+  // A forgotten operation never reports back: its progress text goes, any other message stays.
+  function clearGroupProgress(op) {
+    if ($('status').textContent === `${op.name}: ${op.action}...`) setStatus('')
   }
 
   // Ends a group operation once nothing is pending; reports failures in the status line.
