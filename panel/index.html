@@ -30,9 +30,13 @@
   .list { border: 1px solid var(--orca-border); border-radius: 8px; overflow: hidden; }
   .list .item { padding: var(--space-m) 12px 12px; }
   .list .item:last-child { border-bottom: none; }
-  .vm-line { font-weight: 600; margin-bottom: 4px; }
+  .vm-line { font-weight: 600; margin-bottom: 4px; display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px var(--space-s); }
+  .engine-counts { font-weight: 400; font-size: 11px; color: var(--orca-muted-foreground); }
   .engine-name { font-size: 15px; font-weight: 700; margin: 0 0 var(--space-s); word-break: break-all; }
-  #engine-sel { font: inherit; width: 100%; box-sizing: border-box; margin-bottom: var(--space-s); background: var(--orca-card); color: var(--orca-foreground); border: 1px solid var(--orca-border); border-radius: 4px; padding: 3px 6px; }
+  #vm-others:not(:empty) { border-top: 1px solid var(--orca-border); margin-top: var(--space-m); padding-top: var(--space-m); }
+  .other-engine { display: flex; width: 100%; box-sizing: border-box; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: 2px var(--space-s); margin-top: 4px; text-align: left; }
+  .other-engine .other-name { min-width: 0; overflow-wrap: anywhere; }
+  .other-engine .other-state { color: var(--orca-muted-foreground); font-size: 11px; min-width: 0; text-align: right; margin-left: auto; }
   .ports { display: flex; flex-wrap: wrap; gap: var(--space-s); margin-top: var(--space-s); }
   .port { font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; border: 1px solid var(--orca-border); border-radius: 10px; padding: 1px 8px; background: var(--orca-card); }
   .port b { color: #58a6ff; font-weight: 600; }
@@ -126,7 +130,7 @@
 </head>
 <body>
 <div class="top">
-  <div id="vm" class="card"></div>
+  <div id="vm" class="card" tabindex="-1" hidden><div id="vm-main"></div><div id="vm-others"></div></div>
   <div id="compose" class="card"></div>
 </div>
 <div id="status"></div>
@@ -176,6 +180,7 @@
   let statsTimer = null
   let timer = null
   let vm = null
+  let engineCounts = null // containers of the whole selected engine, from the last listing
   let view = 'worktree' // 'worktree' (follows the focused workspace) or 'all' (overview tree); remembered by the worker
   let pinned = null // { scope, name, sub, focusId, focusDone }: detail view opened from the overview
   let overview = null // latest colima.overview result
@@ -187,6 +192,12 @@
   const followsWorkspace = () => view === 'worktree' && !pinned
   let engineName = null // Docker context the panel is showing; null until the first answer
   let switching = false // an engine change is in flight: polling waits
+  const OTHERS_MS = 10000 // the worker caches the probes for 30s; asking is cheap
+  let others = null // latest colima.others result: counts for the rows listed by colima.vm
+  let othersSeq = 0 // only the newest answer counts
+  let othersHtml = '' // markup on screen: unchanged rows are not rebuilt, so focus stays
+  let othersTimer = null
+  let refocusRow = null // after a switch made from a row: the engine just left, whose row takes the focus
   let vmError = null // { title, text } of the last failed VM operation
   let vmConfirm = null // 'stop' | 'restart' while that VM button waits for confirmation
   let vmConfirmTimer = null
@@ -342,21 +353,64 @@
 
   const startLabel = () => `Start ${vm.engine.label}${vm.controls.size && size ? ` (${size.cpu} CPU, ${size.memory} GB)` : ''}`
 
-  function engineSelect() {
-    const list = vm.engines || []
-    if (list.length < 2) return ''
-    const opts = list.map((e) => {
-      const text = `${e.label}${e.label.includes(e.name) ? '' : ` · ${e.name}`}${e.missing ? ' (missing)' : e.reachable === false ? ' (not running)' : ''}`
-      return `<option value="${esc(e.name)}"${e.current ? ' selected' : ''}>${esc(text)}</option>`
+  const engineText = (e) => `${e.label}${e.label.includes(e.name) ? '' : ` · ${e.name}`}`
+
+  // A non-breaking space keeps each number with its word when the sidebar is narrow.
+  const countsText = (c) => `${c.running}\u00a0running · ${c.stopped}\u00a0stopped`
+  // "engine stopped", so that an engine that is off never reads like a count of stopped containers.
+  const rowText = (st) => (!st ? 'checking…' : st.state === 'running' ? countsText(st) : st.state === 'stopped' ? 'engine stopped' : st.state)
+
+  // The engine switcher below the engine buttons: rows come with colima.vm, counts are filled in from
+  // colima.others. Rendered apart from the card so polls do not rebuild it.
+  function renderOthers() {
+    const el = $('vm-others')
+    const current = vm && vm.engine ? vm.engine.name : null
+    // Counts asked for while another engine was selected say nothing about this one.
+    const counts = new Map((others && others.engineName === current ? others.engines || [] : []).map((e) => [e.name, e]))
+    const rows = ((vm && vm.engines) || []).map((e) => {
+      const st = e.state ? e : counts.get(e.name)
+      const text = rowText(st)
+      return `<button type="button" class="other-engine" data-a="engine" data-t="${esc(e.name)}" title="Switch to this engine"><span class="other-name">${esc(engineText(e))}</span><span class="other-state">${esc(text)}</span></button>`
     }).join('')
-    return `<select id="engine-sel" aria-label="Engine (Docker context)">${opts}</select>`
+    const html = rows ? `<div class="card-title">Switch engine</div>${rows}` : ''
+    const buttons = () => Array.from(el.querySelectorAll('button'))
+    // The row called `name`, else the one now at `index`, else the card itself: focus never falls to the body.
+    const focusRow = (name, index) => {
+      const list = buttons()
+      const target = list.find((b) => b.dataset.t === name) || list[Math.min(index, list.length - 1)] || $('vm')
+      target.focus({ preventScroll: true })
+    }
+    if (html !== othersHtml) {
+      const index = buttons().indexOf(document.activeElement)
+      const name = index < 0 ? null : document.activeElement.dataset.t
+      othersHtml = html
+      el.innerHTML = html
+      if (index >= 0) focusRow(name, index)
+    }
+    if (refocusRow !== null && vm) {
+      if (document.activeElement === document.body) focusRow(refocusRow, 0)
+      refocusRow = null
+    }
+  }
+
+  async function pollOthers() {
+    if (switching) return
+    const seq = ++othersSeq
+    try {
+      const r = await request('colima.others', {})
+      if (seq !== othersSeq || r.stale) return
+      others = r
+      renderOthers()
+    } catch { /* best-effort; the next tick retries */ }
   }
 
   function renderVm() {
-    const el = $('vm')
+    const el = $('vm-main')
+    $('vm').hidden = !vm
+    renderOthers()
     if (!vm) { el.innerHTML = ''; return }
     if (!size) size = { ...vm.prefs }
-    // Polling must not rebuild the selectors while the user has one open.
+    // Polling must not rebuild the CPU/RAM selectors while the user has one open.
     if (el.contains(document.activeElement) && document.activeElement.tagName === 'SELECT') return
     const ctl = vm.controls
     const dockerDown = Boolean(state && state.error)
@@ -367,6 +421,7 @@
     const bits = vm.running
       ? [vm.cpu ? `${vm.cpu} CPU` : '', vm.memory ? `${gb(vm.memory)} RAM` : '', vm.disk ? `${gb(vm.disk)} disk` : '', vm.runtime, vm.arch, vm.version ? `Docker ${vm.version}` : ''].filter(Boolean)
       : []
+    const counts = vm.running && !vmBusy && engineCounts ? `<span class="engine-counts" title="Containers on this engine">${esc(countsText(engineCounts))}</span>` : ''
     const specs = bits.length ? `<div class="sub">${bits.map(esc).join(' &middot; ')}</div>` : ''
     const missing = vm.installed === false ? `<div class="sub">${esc(ctl.missing || 'Engine tools not found.')}</div>` : ''
     const canStart = vm.installed !== false && ctl.start && (!vm.running || dockerDown)
@@ -383,7 +438,7 @@
       : (canStart ? `${sizeSel}<div class="row"><button data-a="vm-start">${esc(startLabel())}</button></div>` : '') + vmButtons
     const gone = vm.engine.missing ? `<div class="err" style="margin-top:6px">The engine context <b>${esc(vm.engine.name)}</b> no longer exists. Select another engine to continue.</div>` : ''
     const err = gone + (vmError ? `<div class="err" style="margin-top:6px">${esc(vmError.title)} failed: <span class="sub">${esc(vmError.text)}</span></div>` : '')
-    el.innerHTML = `<div class="card-title">Engine</div><div class="engine-name">${esc(vm.engine.label)}</div>${engineSelect()}<div class="vm-line"><span class="${cls}">&#9679;</span> ${label[0].toUpperCase() + label.slice(1)}</div>${specs}${missing}${btn}${err}`
+    el.innerHTML = `<div class="card-title">Engine</div><div class="engine-name">${esc(vm.engine.label)}</div><div class="vm-line"><span><span class="${cls}">&#9679;</span> ${label[0].toUpperCase() + label.slice(1)}</span>${counts}</div>${specs}${missing}${btn}${err}`
   }
 
   // Compose errors and the Down confirmation are per scope root + stack id, so they never leak across scopes.
@@ -682,6 +737,7 @@
     const name = nextVm.engine && nextVm.engine.name
     if (other.engineName !== undefined && other.engineName !== name) { engineName = null; return true }
     if (name !== undefined) engineName = name
+    if (others && name !== undefined && others.engineName !== name) { others = null; pollOthers() }
     return false
   }
 
@@ -690,6 +746,7 @@
     if (seq !== modeSeq) return
     if (adoptEngine(nextVm, nextOverview)) return
     vm = nextVm
+    engineCounts = nextOverview.engineCounts || null
     overview = nextOverview
     render()
   }
@@ -706,6 +763,7 @@
       if (seq !== modeSeq) return
       if (adoptEngine(nextVm, nextState)) return
       vm = nextVm
+      engineCounts = nextState.engineCounts || null
       // The VM is going down: nothing to follow or search any more.
       if ((vm.op === 'stopping' || vm.op === 'restarting') && logsId) closeLogs()
       // The pinned worktree / project disappeared: go back to the overview.
@@ -1221,6 +1279,7 @@
     if (a === 'vm-start') { await startVm(b); return }
     if (a === 'vm-op') { await vmAction(b.dataset.c); return }
     if (a === 'compose') { await composeAction(t, b.dataset.c); return }
+    if (a === 'engine') { refocusRow = vm.engine.name; await switchEngine(t); return }
     b.disabled = true
     setStatus(`${a}...`)
     try {
@@ -1311,12 +1370,12 @@
     if (btn && vm) btn.textContent = startLabel()
   })
 
-  // Engine selector: switch the Docker context, drop everything bound to the old engine and reload.
-  document.addEventListener('change', async (e) => {
-    if (e.target.id !== 'engine-sel') return
-    const name = e.target.value
-    e.target.blur()
+  // Switch the Docker context, drop everything bound to the old engine and reload.
+  async function switchEngine(name) {
+    if (switching) return
     switching = true
+    others = null
+    othersSeq++ // answers still in flight are about the previous engine
     engineName = name // answers for the previous engine are dropped from now on
     clearVmConfirm()
     vmError = null
@@ -1336,7 +1395,8 @@
     modeSeq++
     busy = false
     refresh()
-  })
+    pollOthers()
+  }
 
   window.orca.plugin.on('colima.started', (res) => {
     vmError = res && !res.ok ? { title: 'Start', text: res.error || 'Unknown error' } : null
@@ -1581,11 +1641,13 @@
     refresh()
     timer = setInterval(refresh, POLL_MS)
     statsTimer = setInterval(pollStats, STATS_MS)
+    pollOthers()
+    othersTimer = setInterval(pollOthers, OTHERS_MS)
     // The worker drops followers of an idle (hidden) panel: pick the stream up again.
     if (logsId && logsMode === 'live' && !logsLive) startLive()
     if (!eventsLive) ctxTimer = setInterval(watchContext, CONTEXT_CHECK_MS)
   }
-  function stopPolling() { if (logsId) setLogsState(false, "Paused"); clearInterval(timer); clearInterval(ctxTimer); clearInterval(statsTimer); timer = null; ctxTimer = null; statsTimer = null }
+  function stopPolling() { if (logsId) setLogsState(false, "Paused"); clearInterval(timer); clearInterval(ctxTimer); clearInterval(statsTimer); clearInterval(othersTimer); timer = null; ctxTimer = null; statsTimer = null; othersTimer = null }
   document.addEventListener('visibilitychange', () => document.hidden ? stopPolling() : startPolling())
   window.orca.plugin.on('colima.refresh', refresh)
   // Focus or terminal changes arrive as events. Each new subscriber first gets the current context,
