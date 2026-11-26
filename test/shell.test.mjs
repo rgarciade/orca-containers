@@ -7,7 +7,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { EngineError, guardEngine } from '../lib/docker.mjs'
-import { buildShellCommand, shellQuote } from '../lib/shell.mjs'
+import { buildLogsCommand, buildShellCommand, shellQuote } from '../lib/shell.mjs'
 
 // The words /sh sees in `command`, NUL-separated so newlines inside a word survive.
 // It runs in a throwaway directory with no usable PATH, so a quoting regression cannot touch the repository
@@ -67,6 +67,36 @@ describe('buildShellCommand', () => {
   test('throws on anything that is not a lowercase hex container id', () => {
     for (const id of ['', 'abc', 'my-container', '--privileged', `${ID};id`, `${ID} -u root`, `${ID}\n`, `\n${ID}`, ID.toUpperCase(), 'a'.repeat(65), undefined, null]) {
       assert.throws(() => buildShellCommand(BIN, null, id), /Invalid container id/, JSON.stringify(id))
+    }
+  })
+})
+
+describe('buildLogsCommand', () => {
+  const ID = '0123456789ab'
+  const BIN = '/Applications/My Apps/docker'
+
+  test('follows the log of one container on an explicit context', () => {
+    assert.deepEqual(shellWords(buildLogsCommand(BIN, 'colima', ID, { tail: 200, follow: true })),
+      [BIN, '--context', 'colima', 'logs', '-f', '--tail', '200', '--timestamps', ID])
+  })
+
+  test('omits -f and --context when not asked for', () => {
+    assert.deepEqual(shellWords(buildLogsCommand(BIN, null, ID, { tail: 50, follow: false })), [BIN, 'logs', '--tail', '50', '--timestamps', ID])
+  })
+
+  test('keeps a hostile binary path and context name literal', () => {
+    const bin = "/tmp/x'; echo pwned; '/docker"
+    const context = '$(echo pwned) --privileged'
+    assert.deepEqual(shellWords(buildLogsCommand(bin, context, ID, { tail: 1, follow: false })),
+      [bin, '--context', context, 'logs', '--tail', '1', '--timestamps', ID])
+  })
+
+  test('throws on a bad id or tail', () => {
+    for (const id of ['', 'my-container', '--details', `${ID};id`, `${ID}\n`, ID.toUpperCase(), undefined]) {
+      assert.throws(() => buildLogsCommand(BIN, null, id, { tail: 200 }), /Invalid container id/, JSON.stringify(id))
+    }
+    for (const tail of [0, -1, 1.5, '200', 'all', undefined]) {
+      assert.throws(() => buildLogsCommand(BIN, null, ID, { tail }), /Invalid tail/, JSON.stringify(tail))
     }
   })
 })

@@ -2,21 +2,22 @@
 // The panel polls `colima.state`; all process execution happens in this worker (modules in lib/).
 import { unlinkSync } from 'node:fs'
 import { composeRun, stateForScope } from './lib/compose.mjs'
-import { CONTAINER_ID_RE, listContainers } from './lib/containers.mjs'
+import { listContainers } from './lib/containers.mjs'
 import { activeContext, contexts, dockerArgs, ENGINE_KEY, ensureEngine, EngineError, engineScope, loadContexts, selectEngine } from './lib/docker.mjs'
 import { validateContext } from './lib/engines/context.mjs'
 import { otherEngines, resetOthersCache } from './lib/engines/others.mjs'
 import { engineInfo, hostLimits, loadPrefs, startVm, vmOp, vmOpName, vmStatus } from './lib/engines/vm.mjs'
-import { DOCKER, orcaJson, run } from './lib/exec.mjs'
+import { DOCKER, run } from './lib/exec.mjs'
 import { followers, followLogs, killFollower, noteToken, sweepFollowers, tokenOf, touchPanel } from './lib/logs/follow.mjs'
 import { contextLogs, olderLogs } from './lib/logs/history.mjs'
 import { cleanupStaleDocker, PID_FILE } from './lib/logs/process.mjs'
 import { killSearch, searches, searchLogs } from './lib/logs/search.mjs'
 import { buildOverview } from './lib/overview.mjs'
 import { NOT_OWNED, orcaLists, ownedContainer, resetListsCache } from './lib/scope.mjs'
-import { buildShellCommand } from './lib/shell.mjs'
+import { logsHeightPref } from './lib/prefs.mjs'
 import { statsForScope } from './lib/stats.mjs'
-import { resetPathCache, resolveActiveWorktree } from './lib/worktree.mjs'
+import { logsTerminal, shellTerminal } from './lib/terminal.mjs'
+import { resetPathCache } from './lib/worktree.mjs'
 
 const SWEEP_MS = 5000
 const VIEW_KEY = 'view'
@@ -79,6 +80,9 @@ export default async function activate(orca) {
     return { view: 'worktree' }
   })
 
+  // The log box height chosen in the panel, remembered like the view.
+  handle('colima.logs.height', async (input) => logsHeightPref(orca, input))
+
   handle('colima.vm', async () => {
     // Contexts come and go (docker context create/rm): re-read them, and re-pick if the chosen one vanished.
     await loadContexts()
@@ -127,19 +131,8 @@ export default async function activate(orca) {
     return res.ok ? { ok: true } : { ok: false, message: res.stderr.slice(0, 300) }
   })
 
-  handle('colima.shell', async (input) => {
-    const { worktree, kind, target } = await ownedContainer(orca, String(input?.id ?? ''), input?.scope, true)
-    if (!target) return NOT_OWNED
-    if (!CONTAINER_ID_RE.test(target.id)) return { ok: false, message: 'Unexpected container id.' }
-    if (target.state !== 'running') return { ok: false, message: 'A shell needs a running container.' }
-    // A terminal tab must belong to a worktree: containers outside one open in the focused workspace.
-    // Not `--worktree active`: the CLI resolves that from its cwd, which for the worker is no worktree.
-    const where = kind === 'worktree' && worktree ? { path: worktree } : await resolveActiveWorktree(orca)
-    if (!where.path) return { ok: false, message: `A shell opens in the focused workspace: ${where.error}` }
-    const res = await orcaJson(['terminal', 'create', '--worktree', `path:${where.path}`, '--title', `sh ${target.name}`,
-      '--command', buildShellCommand(DOCKER, activeContext, target.id), '--focus'])
-    return res.ok ? { ok: true } : { ok: false, message: `orca CLI failed: ${String(res.error?.message ?? '').slice(0, 200)}` }
-  })
+  handle('colima.shell', async (input) => shellTerminal(orca, input))
+  handle('colima.logs.terminal', async (input) => logsTerminal(orca, input))
 
   orca.commands.register('colima.refresh', async () => {
     orca.panels.post('colima.refresh', {})

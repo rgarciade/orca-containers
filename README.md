@@ -16,7 +16,7 @@ or any other Docker context.
 | **Containers** | Two views, remembered between sessions. *This worktree* follows the focused workspace: containers whose Compose working directory is inside it, with status, CPU and memory usage, and start/stop. *All* is an overview tree (Orca project, worktree, containers, then other Compose projects and individual containers) with status and ports; click a worktree, a Compose project or one of its containers to open its detail view, and use **← All** to go back. Right-click a worktree, Compose project or container (or use the **⋯** button, Shift+F10 or the context-menu key) for a menu with details, logs, start, stop, restart, down, up and shell. Containers that are unhealthy, restarting, starting their healthcheck or stopped with an abnormal exit code (other than 0, 130 and 143) are labelled. A collapsed group counts its unhealthy, restarting and abnormally exited containers (exit 137 and `health: starting` are not counted). |
 | **Shell** | Open a shell (bash when the image has it, else sh) in any running container, as a new terminal tab in Orca: in the container's worktree, or in the focused workspace for containers outside Orca worktrees. |
 | **Ports** | Published ports as chips (`host port → container port`); internal-only ports are shown dashed. Click a chip to copy `host:port`. |
-| **Logs** | *Live* mode follows the container's output with timestamps. *History* mode pages back through older lines and searches the whole log (plain text, optional case sensitivity), with a jump to the context around any match. |
+| **Logs** | *Live* mode follows the container's output with timestamps. *History* mode pages back through older lines and searches the whole log (plain text, optional case sensitivity), with a jump to the context around any match. **Expand** fills the panel with the viewer (**Collapse** or Escape goes back). Drag the bar under the log, or focus it and use the arrow keys, to change its height (remembered; Enter or double-click resets it). **Open in terminal** opens a new Orca terminal tab with the last 200 lines, following unless the container is stopped, in the same worktree as **Shell** would use. That terminal is yours: the plugin never closes it. |
 
 The panel follows workspace switches: when you move to another worktree it shows that
 worktree's stacks and containers.
@@ -54,14 +54,14 @@ terminal. Giving the worktree a unique name in Orca also resolves it.
 | Capability | Why |
 | --- | --- |
 | `workspace:read` | Know which worktree is focused. |
-| `storage:own` | Remember the chosen engine, and the CPU and memory chosen for the Colima VM. |
+| `storage:own` | Remember the chosen engine, container view and log height, and the CPU and memory chosen for the Colima VM. |
 | `notifications:show` | Confirm the **Containers: refresh** palette command. |
 
 For the **Switch engine** list the worker also runs `docker --context <name> ps -a --format '{{.State}}'` on the other local
 engines (`unix://` sockets and local named pipes); listing them never contacts remote contexts.
 
 The worker runs `docker`, the engine CLIs and the `orca` CLI as child processes without a shell, except
-for the terminal commands (shell and log watchdog), which only receive validated container ids
+for the shell and log terminals and the log watchdog, which only receive validated container ids
 and quoted paths. Container actions are limited to the containers
 of the scope the panel is acting on (the active worktree, or a worktree, Compose project or container
 chosen in the *All* view), and the worker checks that membership on every request. Log processes are
@@ -77,7 +77,9 @@ worker exits, even if it is killed abruptly.
   - `engines/`: `context.mjs` (context parsing and engine detection), `control.mjs` (engine CLI commands), `vm.mjs` (status, start, stop, restart), `others.mjs` (the Switch engine list).
   - `worktree.mjs`, `scope.mjs`: the focused worktree, scope validation and container ownership.
   - `compose-stacks.mjs`, `compose.mjs`: stack discovery and Compose actions.
-  - `overview.mjs`, `stats.mjs`, `shell.mjs`: the All tree, CPU and memory, the shell command.
+  - `overview.mjs`, `stats.mjs`: the All tree, CPU and memory.
+  - `terminal.mjs`, `shell.mjs`: the shell and log terminal tabs and their command lines.
+  - `prefs.mjs`: the remembered log height.
   - `logs/`: `process.mjs` (log processes and watchdog), `follow.mjs`, `history.mjs`, `search.mjs`, `text.mjs`.
 - `panel/index.html`: the sidebar panel.
 - `test/`: unit tests for the worker's logic.
