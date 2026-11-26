@@ -1,7 +1,7 @@
 // Docker context parsing, engine choice and adapter detection.
 import { describe, test } from 'node:test'
 import assert from 'node:assert/strict'
-import { chooseEngine, detectAdapter, parseContexts } from '../worker.mjs'
+import { chooseEngine, detectAdapter, parseContexts } from '../lib/engines/context.mjs'
 
 describe('chooseEngine', () => {
   const list = [{ name: 'default', current: false }, { name: 'colima', current: true }]

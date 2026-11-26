@@ -1,7 +1,9 @@
 // Scope validation and ownership: the panel is untrusted, so only exact, live matches may pass.
 import { describe, test } from 'node:test'
 import assert from 'node:assert/strict'
-import { containersOfWorktree, containersOutsideScope, deepestRoot, validateContext, validateScope } from '../worker.mjs'
+import { containersOutsideScope } from '../lib/compose-stacks.mjs'
+import { validateContext } from '../lib/engines/context.mjs'
+import { containersOfWorktree, deepestRoot, validateScope } from '../lib/scope.mjs'
 
 const ID = 'a1b2c3d4e5f6'
 const worktrees = [

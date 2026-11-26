@@ -19,7 +19,7 @@ async function loadWorker(tag, installed) {
   }
   setExistsSync(fake)
   try {
-    const worker = await import(`../worker.mjs?${tag}`)
+    const worker = await import(`../lib/engines/control.mjs?${tag}`)
     return { enginePlan: (...args) => withFake(() => worker.enginePlan(...args)) }
   } finally {
     setExistsSync(realExistsSync)

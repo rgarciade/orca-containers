@@ -5,7 +5,8 @@ import assert from 'node:assert/strict'
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { containerCounts, endpointKey, localEndpoint, otherEngineRow, otherEngineStatus, probeOncePerDaemon, selectOtherEngines, socketMissing } from '../worker.mjs'
+import { containerCounts } from '../lib/containers.mjs'
+import { endpointKey, localEndpoint, otherEngineRow, otherEngineStatus, probeOncePerDaemon, selectOtherEngines, socketMissing } from '../lib/engines/others.mjs'
 
 const dir = mkdtempSync(join(tmpdir(), 'other-engines-'))
 after(() => rmSync(dir, { recursive: true, force: true }))
