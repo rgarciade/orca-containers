@@ -8,7 +8,7 @@ import { validateContext } from './lib/engines/context.mjs'
 import { otherEngines, resetOthersCache } from './lib/engines/others.mjs'
 import { engineInfo, hostLimits, loadPrefs, startVm, vmOp, vmOpName, vmStatus } from './lib/engines/vm.mjs'
 import { DOCKER, run } from './lib/exec.mjs'
-import { followers, followLogs, killFollower, noteToken, sweepFollowers, tokenOf, touchPanel } from './lib/logs/follow.mjs'
+import { followers, followLogs, killFollower, stopLogs, sweepFollowers, touchPanel } from './lib/logs/follow.mjs'
 import { contextLogs, olderLogs } from './lib/logs/history.mjs'
 import { cleanupStaleDocker, PID_FILE } from './lib/logs/process.mjs'
 import { killSearch, searches, searchLogs } from './lib/logs/search.mjs'
@@ -51,7 +51,7 @@ export default async function activate(orca) {
   const sweeper = setInterval(() => { sweepFollowers(orca).catch(() => {}) }, SWEEP_MS)
   sweeper.unref?.()
   const killAll = () => {
-    for (const panelId of [...followers.keys()]) killFollower(panelId, null, orca)
+    for (const panelId of [...followers.keys()]) killFollower(panelId, null, null, orca)
     for (const panelId of [...searches.keys()]) killSearch(panelId)
   }
   process.once('exit', () => { killAll(); try { unlinkSync(PID_FILE) } catch { /* none */ } })
@@ -116,7 +116,7 @@ export default async function activate(orca) {
   handle('colima.compose', async (input) => composeRun(orca, input))
 
   handle('colima.logs.follow', async (input, ctx) => followLogs(orca, ctx.panel.id, input))
-  handle('colima.logs.stop', async (input, ctx) => { noteToken(ctx.panel.id, tokenOf(input)); killFollower(ctx.panel.id, null, orca); killSearch(ctx.panel.id); return { ok: true } })
+  handle('colima.logs.stop', async (input, ctx) => stopLogs(orca, ctx.panel.id, input))
 
   handle('colima.logs.older', async (input) => olderLogs(orca, input))
   handle('colima.logs.search', async (input, ctx) => searchLogs(orca, ctx.panel.id, input, ctx.signal))
