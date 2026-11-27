@@ -152,7 +152,8 @@ async function boot(handlers = {}, ids = [ID], workspace = {}) {
     return event
   }
   const push = async (name, data) => { pushed[name](data); await settle() }
-  const card = (id = ID) => $('content').querySelector(`.item[data-cid="${id}"]`)
+  // A card of the detail view, or a row of the All tree.
+  const card = (id = ID) => $('content').querySelector(`.item[data-cid="${id}"]`) ?? $('content').querySelector(`.titem[data-cid="${id}"]`)
   const viewer = (id = ID) => card(id)?.querySelector('.logv') ?? null
   const open = (id = ID) => run(`openLogs('${id}')`)
   const part = (name, id = ID) => viewer(id).querySelector(`[data-lv="${name}"]`)
@@ -254,12 +255,6 @@ describe('viewers inside the cards', () => {
     assert.match(p.card().children[0].innerHTML, /&lt;img src=x&gt;/)
   })
 
-  test('Logs from the All view opens the viewer in that scope', async () => {
-    const p = await boot({ 'colima.view': () => ({ view: 'worktree' }) })
-    await p.run(`openScope({ open: 'worktree', v: '/w', n: 'w', cid: '${ID}', logs: true })`)
-    assert.ok(p.viewer())
-    assert.deepEqual(JSON.parse(JSON.stringify(p.sent('colima.logs.follow').map((i) => i.scope))), [SCOPE])
-  })
 })
 
 describe('polling', () => {
@@ -681,6 +676,16 @@ describe('log height', () => {
     assert.deepEqual(heights(p), [350])
   })
 
+  test('keeps the bar in view while dragging, so a log growing past the bottom edge is seen to grow', async () => {
+    const p = await boot(saved(null))
+    await p.open()
+    p.find('logv-box').offsetHeight = 200
+    await p.emit('pointerdown', p.part('resize'), { button: 0, clientY: 500, pointerId: 1 })
+    p.document.revealed.length = 0
+    await p.emit('pointermove', p.body, { buttons: 1, clientY: 650 })
+    assert.deepEqual(p.document.revealed, [{ el: p.part('resize'), options: { block: 'nearest' } }])
+  })
+
   test('a late saved value does not override a height just chosen', async () => {
     let answer
     const p = await boot({ 'colima.logs.height': (input) => ('height' in input ? {} : new Promise((resolve) => { answer = resolve })) })
@@ -755,5 +760,283 @@ describe('status line', () => {
     await p.run("groupOps.set('k', { name: 'web', action: 'stop', pending: new Set(['p:web']), errors: [] }); setStatus('web: stop...')")
     await p.run("switchEngine('orbstack')")
     assert.equal(p.$('status').textContent, '')
+  })
+})
+
+describe('All view', () => {
+  // One container of each kind: in a worktree, in a Compose project, individual, and in a project without a workdir.
+  const [W, K, I, N] = [ID, B, C, D]
+  const SCOPES = { [W]: SCOPE, [K]: { kind: 'compose', workdir: '/c' }, [I]: { kind: 'container', id: I } }
+  const group = (containers) => ({ running: containers.filter((c) => c.state === 'running').length, total: containers.length, containers })
+  const tree = ({ wt = [container(W)], cmp = [container(K)], ind = [container(I)], bare = [] } = {}) => ({
+    engineName: 'colima', error: null,
+    projects: wt.length ? [{ id: 'r', name: 'proj', ...group(wt), worktrees: [{ path: '/w', name: 'wt', branch: 'main', ...group(wt) }] }] : [],
+    other: { ...group([...cmp, ...bare]), projects: [
+      ...(cmp.length ? [{ key: 'k', name: 'cmp', workdir: '/c', ...group(cmp) }] : []),
+      ...(bare.length ? [{ key: 'n', name: 'bare', workdir: null, ...group(bare) }] : [])
+    ] },
+    individual: group(ind)
+  })
+  const handlers = {
+    'colima.logs.older': () => ({ ok: true, text: '2024-05-01T10:00:00Z boom\n', done: false }),
+    'colima.logs.search': () => ({ ok: true, lines: ['2024-05-01T10:00:00Z boom'], total: 1, truncated: false }),
+    'colima.logs.context': () => ({ ok: true, lines: [] }),
+    'colima.logs.terminal': () => ({ ok: true }),
+    'colima.shell': () => ({ ok: true })
+  }
+  async function all(shape = {}, more = {}) {
+    const current = { tree: tree(shape), engine: 'colima' }
+    const p = await boot({
+      ...handlers,
+      'colima.view': () => ({ view: 'all' }),
+      'colima.overview': () => ({ ...current.tree, engineName: current.engine }),
+      'colima.vm': () => vmAnswer(current.engine),
+      ...more
+    })
+    // A click on a row's own button; the row around it is clickable too, as in the real markup.
+    const act = (a, id) => {
+      const button = { dataset: { row: a, t: id }, disabled: false }
+      const row = { dataset: { open: 'worktree', v: '/w', n: 'wt', cid: id } }
+      return p.emit('click', { id: '', closest: (sel) => (sel === '[data-row]' ? button : sel === '[data-open]' ? row : null) })
+    }
+    const next = async (shape) => { current.tree = tree(shape); await p.poll() }
+    const markup = (id) => p.card(id).children[0].innerHTML
+    const scopes = (name) => p.sent(name).map((i) => JSON.parse(JSON.stringify([i.id, i.scope ?? null])))
+    const detail = () => p.sent('colima.state').length
+    return { ...p, current, act, next, markup, scopes, detail }
+  }
+
+  test('every actionable row has a logs button, running ones also shell', async () => {
+    const p = await all({ wt: [container(W, { name: '<img src=x>' })], cmp: [container(K, { state: 'exited' })], bare: [container(N)] })
+    for (const id of [W, K, I]) assert.match(p.markup(id), new RegExp(`data-row="logs" data-t="${id}"`))
+    assert.match(p.markup(W), /data-row="shell"/)
+    assert.match(p.markup(I), /data-row="shell"/)
+    assert.doesNotMatch(p.markup(K), /data-row="shell"/)
+    assert.doesNotMatch(p.markup(W), /data-row="(stop|start|restart)"|<img/)
+    assert.match(p.markup(W), /aria-label="Logs of &lt;img src=x&gt;"/)
+    // No scope the worker would accept: no actions, as in the context menu.
+    assert.doesNotMatch(p.markup(N), /data-row/)
+    await p.act('logs', N)
+    assert.deepEqual(p.openIds(), [])
+  })
+
+  test('logs opens the viewer below the row without leaving All, and toggles it', async () => {
+    const p = await all()
+    await p.act('logs', W)
+    assert.equal(p.card(W).children[1], p.viewer(W))
+    assert.equal(p.find('logv-title', W).textContent, 'Logs: web-01')
+    assert.equal(await p.run('pinned'), null)
+    assert.equal(p.detail(), 0)
+    await p.chunk('one\n', W)
+    assert.deepEqual(p.lines(W), ['one'])
+    await p.act('logs', W)
+    assert.deepEqual(p.openIds(), [])
+    assert.deepEqual(p.scopes('colima.logs.stop'), [[W, SCOPE]])
+  })
+
+  test('a running shell stays focusable and is not started twice', async () => {
+    const p = await all({}, { 'colima.shell': () => new Promise(() => {}) })
+    await p.act('shell', W)
+    assert.match(p.markup(W), /data-row="shell"[^>]* aria-disabled="true"/)
+    assert.doesNotMatch(p.markup(W), / disabled/)
+    await p.act('shell', W)
+    assert.equal(p.sent('colima.shell').length, 1)
+  })
+
+  test('no viewer opens in a row that an error has replaced', async () => {
+    let fail = false
+    const p = await all({}, { 'colima.overview': () => (fail ? Promise.reject(new Error('timed out')) : tree()) })
+    fail = true
+    await p.poll()
+    await p.run(`openLogs('${W}')`)
+    assert.deepEqual(p.sent('colima.logs.follow'), [])
+    fail = false
+    await p.poll()
+    assert.deepEqual(p.openIds(), [])
+    await p.act('logs', W)
+    assert.deepEqual(p.openIds(), [W])
+  })
+
+  test('shell opens a terminal in the scope of the row, without opening the detail view', async () => {
+    const p = await all()
+    for (const id of [W, K, I]) await p.act('shell', id)
+    assert.deepEqual(p.scopes('colima.shell'), [W, K, I].map((id) => [id, SCOPES[id]]))
+    assert.equal(p.detail(), 0)
+    assert.equal(await p.run('pinned'), null)
+  })
+
+  test('every request of a viewer carries the scope of its own container', async () => {
+    const p = await all()
+    for (const id of [W, K, I]) await p.act('logs', id)
+    for (const id of [W, K, I]) {
+      await p.click('terminal', id)
+      await p.click('mode', id)
+      await p.click('older', id)
+      p.part('q', id).value = 'boom'
+      await p.key('Enter', p.part('q', id))
+      await p.run(`openContext(viewers.get('${id}'), '2024-05-01T10:00:00Z')`)
+      await p.key('Escape', p.part('q', id)) // clearing stops the search
+      await p.click('close', id)
+    }
+    const expected = (n) => [W, K, I].flatMap((id) => Array(n).fill([id, SCOPES[id]]))
+    assert.deepEqual(p.scopes('colima.logs.follow'), expected(1))
+    assert.deepEqual(p.scopes('colima.logs.terminal'), expected(1))
+    assert.deepEqual(p.scopes('colima.logs.older'), expected(2))
+    assert.deepEqual(p.scopes('colima.logs.search'), expected(1))
+    assert.deepEqual(p.scopes('colima.logs.context'), expected(1))
+    assert.deepEqual(p.scopes('colima.logs.stop'), expected(3)) // history, clearing, close
+  })
+
+  test('Logs in the context menu does the same as the button', async () => {
+    const p = await all()
+    const pick = () => p.run(`openMenu('k:${K}', 1, 1); menuActivate('logs')`)
+    await pick()
+    assert.ok(p.viewer(K))
+    assert.equal(await p.run('pinned'), null)
+    assert.deepEqual(p.scopes('colima.logs.follow'), [[K, SCOPES[K]]])
+    await pick()
+    assert.deepEqual(p.openIds(), [])
+  })
+
+  test('at most three viewers across groups; a fourth closes the oldest', async () => {
+    const p = await all({ ind: [container(I), container(N)] })
+    for (const id of [W, K, I, N]) await p.act('logs', id)
+    assert.deepEqual(p.openIds(), [K, I, N])
+    assert.deepEqual(p.scopes('colima.logs.stop'), [[W, SCOPE]])
+    assert.match(p.find('logv-note', N).textContent, /web-01.*3/)
+  })
+
+  test('polls keep scroll, search text, caret and focus, however the tree changes', async () => {
+    const p = await all()
+    await p.act('logs', K)
+    await p.chunk('one\ntwo\n', K)
+    const pre = box(p, 120, K)
+    const row = p.card(K)
+    const viewer = p.viewer(K)
+    const q = p.part('q', K)
+    q.value = 'needle'
+    q.selectionStart = q.selectionEnd = 3
+    q.focus()
+    const kept = () => {
+      assert.equal(p.card(K), row)
+      assert.equal(p.viewer(K), viewer)
+      assert.equal(row.attached, 1, 'the row was moved')
+      assert.equal(viewer.attached, 1, 'the viewer was moved')
+      assert.equal(pre.scrollTop, 120)
+      assert.deepEqual([q.value, q.selectionStart, q.selectionEnd], ['needle', 3, 3])
+      assert.equal(p.document.activeElement, q)
+    }
+    await p.next()
+    kept()
+    await p.next({ wt: [container(W), container(N)], cmp: [container(K, { status: 'Up 2 minutes', name: 'renamed' })] })
+    assert.match(p.markup(K), /Up 2 minutes/)
+    assert.equal(p.find('logv-title', K).textContent, 'Logs: renamed')
+    kept()
+    await p.next({ wt: [], cmp: [container(N), container(K)], ind: [] })
+    kept()
+    assert.deepEqual(p.stops(), [])
+  })
+
+  test('keeps scroll and focus when two rows with viewers swap places', async () => {
+    const p = await all({ ind: [container(I), container(N)] })
+    await p.act('logs', I)
+    await p.act('logs', N)
+    const pre = box(p, 120, I)
+    const q = p.part('q', I)
+    q.focus()
+    await p.next({ ind: [container(N), container(I)] })
+    assert.deepEqual(p.openIds(), [N, I])
+    assert.equal(pre.scrollTop, 120)
+    assert.equal(p.document.activeElement, q)
+  })
+
+  test('collapsing a group closes the viewers inside it only', async () => {
+    for (const [key, closed] of [['p:r', W], ['w:/w', W], ['o:k', K], ['other', K], ['individual', I]]) {
+      const p = await all()
+      for (const id of [W, K, I]) await p.act('logs', id)
+      await p.run(`toggleGroup('${key}')`)
+      assert.deepEqual(p.openIds(), [W, K, I].filter((id) => id !== closed), key)
+      assert.deepEqual(p.stops(), [closed], key)
+      await p.run(`toggleGroup('${key}')`)
+      assert.ok(p.card(closed), key)
+      assert.equal(p.viewer(closed), null, key)
+    }
+  })
+
+  test('a container that disappears closes its viewer; none left, or a Docker error, closes all', async () => {
+    const p = await all()
+    await p.act('logs', W)
+    await p.act('logs', K)
+    await p.next({ wt: [] })
+    assert.deepEqual(p.openIds(), [K])
+    assert.deepEqual(p.stops(), [W])
+    await p.next({ wt: [], cmp: [], ind: [] })
+    assert.deepEqual(p.stops(), [W, '*'])
+    await p.next()
+    await p.act('logs', I)
+    p.current.tree = { ...tree(), error: 'Cannot connect' }
+    await p.poll()
+    assert.deepEqual(p.openIds(), [])
+    assert.deepEqual(p.stops(), [W, '*', '*'])
+  })
+
+  test('a failed poll keeps the viewers and shows the error', async () => {
+    let fail = false
+    const p = await all({}, { 'colima.overview': () => (fail ? Promise.reject(new Error('timed out')) : tree()) })
+    await p.act('logs', W)
+    const pre = box(p, 120, W)
+    fail = true
+    await p.poll()
+    assert.match(p.$('content').children[0].innerHTML, /timed out/)
+    assert.equal(p.viewer(W).attached, 1)
+    fail = false
+    await p.poll()
+    assert.doesNotMatch(p.$('content').children[0].innerHTML, /timed out/)
+    assert.equal(pre.scrollTop, 120)
+    assert.equal(p.viewer(W).attached, 1)
+  })
+
+  test('view, scope, engine and VM changes close all', async () => {
+    const leaves = ["setView('worktree')", "switchEngine('orbstack')", "openScope({ open: 'worktree', v: '/w' })", "(vmConfirm = 'stop', vmConfirmAt = 0, vmAction('stop'))"]
+    for (const leave of leaves) {
+      const p = await all()
+      await p.act('logs', W)
+      await p.act('logs', K)
+      await p.run(leave)
+      assert.deepEqual(p.openIds(), [], leave)
+      assert.deepEqual(p.stops(), ['*'], leave)
+    }
+  })
+
+  test('an engine changed or stopping elsewhere closes all', async () => {
+    const p = await all()
+    await p.act('logs', W)
+    p.current.engine = 'orbstack'
+    await p.poll() // dropped as stale
+    await p.poll()
+    assert.deepEqual(p.openIds(), [])
+    const q = await all({}, { 'colima.vm': () => ({ ...vmAnswer(), op: q?.stopping ? 'stopping' : null }) })
+    await q.act('logs', W)
+    q.stopping = true
+    await q.poll()
+    assert.deepEqual(q.openIds(), [])
+  })
+
+  test('follows again after being hidden, each viewer in its scope', async () => {
+    const p = await all()
+    await p.act('logs', W)
+    await p.act('logs', I)
+    p.document.hidden = true
+    await p.emit('visibilitychange', p.body)
+    p.document.hidden = false
+    await p.emit('visibilitychange', p.body)
+    assert.deepEqual(p.scopes('colima.logs.follow'), [[W, SCOPE], [I, SCOPES[I]], [W, SCOPE], [I, SCOPES[I]]])
+  })
+
+  test('the detail view sends no scope of its own', async () => {
+    const p = await boot(handlers)
+    await p.press('logs')
+    await p.click('close')
+    assert.deepEqual([...p.sent('colima.logs.follow'), ...p.sent('colima.logs.stop')].map((i) => i.scope), [undefined, undefined])
   })
 })
