@@ -22,13 +22,13 @@
   "capabilities": [{ "kind": "notifications:show" }, { "kind": "workspace:read" }, { "kind": "storage:own" }],
   "cover": {
     "path": "images/cover.png",
-    "alt": "Containers panel in Orca's sidebar: engine card and All view, with container cards showing ports, CPU and memory"
+    "alt": "Containers panel in Orca's sidebar: engine card and All view, with ports, health markers, and logs and shell buttons per container"
   },
   "screenshots": [
     {
       "path": "images/screenshot-all.png",
-      "alt": "Engine card with the Switch engine list and its running and stopped counts, above the All view grouped by project and worktree",
-      "caption": "Switch engines and see what runs"
+      "alt": "The All view grouped by project and worktree, with logs and shell buttons per row and live logs open below one container",
+      "caption": "Logs and shell from the All view"
     },
     {
       "path": "images/screenshot-ports.png",
@@ -37,7 +37,7 @@
     },
     {
       "path": "images/screenshot-detail.png",
-      "alt": "A worktree's detail view with Up, Restart and Down for its Compose stack, and ports, CPU, memory, logs, stop and shell per container",
+      "alt": "A worktree's detail view with Restart and Down for its Compose stack; ports, CPU, memory, logs, stop and shell per container, and one log open",
       "caption": "Run a Compose project from the sidebar"
     },
     {

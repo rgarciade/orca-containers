@@ -5,7 +5,7 @@ Manage your Docker engine and the containers of the worktree you are working in,
 [Colima](https://github.com/abiosoft/colima), Docker Desktop, OrbStack, Podman, Rancher Desktop
 or any other Docker context.
 
-![The Containers panel in Orca's sidebar: engine card, All view and container cards with ports, CPU and memory](images/cover.png)
+![The Containers panel in Orca's sidebar: engine card and All view with ports, health markers, and logs and shell buttons](images/cover.png)
 
 ## Features
 
