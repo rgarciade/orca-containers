@@ -17,7 +17,7 @@
   .sub { color: var(--orca-muted-foreground); font-size: 11px; word-break: break-all; }
   .row { display: flex; gap: 8px; margin-top: var(--space-m); flex-wrap: wrap; }
   button { font: inherit; background: var(--orca-secondary); color: var(--orca-secondary-foreground); border: 1px solid var(--orca-border); border-radius: 4px; padding: 3px 10px; cursor: pointer; }
-  button:disabled { opacity: .5; cursor: default; }
+  button:disabled, button[data-row][aria-disabled="true"] { opacity: .5; cursor: default; }
   pre { background: var(--orca-card); border: 1px solid var(--orca-border); padding: 8px; overflow: auto; white-space: pre-wrap; word-break: break-all; margin: 4px 0; }
   /* Layout: VM and Compose are side-by-side cards (wrapping when narrow); containers are a list below. */
   .top { display: flex; flex-wrap: wrap; gap: var(--space-m); align-items: stretch; }
@@ -62,7 +62,7 @@
   .bar { height: 3px; border-radius: 2px; background: var(--orca-border); margin-top: 3px; width: 33%; min-width: 80px; max-width: 100%; overflow: hidden; }
   .bar > i { display: block; height: 100%; background: #58a6ff; }
   .bar.mem > i { background: #3fb950; }
-  /* One log viewer per card, below its buttons. */
+  /* One log viewer per card (below its buttons) or per row of the All tree (below the row). */
   .logv { margin-top: var(--space-m); min-width: 0; }
   .logv [hidden] { display: none !important; }
   .logv-head { display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-s); }
@@ -89,7 +89,7 @@
   .logv-search { display: flex; align-items: center; gap: var(--space-s); flex-wrap: wrap; margin-top: var(--space-s); }
   .logv-q { flex: 1 1 140px; min-width: 0; font: inherit; background: var(--orca-card); color: var(--orca-foreground); border: 1px solid var(--orca-border); border-radius: 4px; padding: 3px 6px; }
   button[aria-pressed] { min-width: 28px; }
-  button[aria-pressed="true"], button.on, button[data-a="logs"][aria-expanded="true"] { background: rgba(88, 166, 255, .28); border-color: #58a6ff; color: var(--orca-foreground); font-weight: 700; box-shadow: inset 0 0 0 1px #58a6ff; }
+  button[aria-pressed="true"], button.on, button[data-a="logs"][aria-expanded="true"], button[data-row="logs"][aria-expanded="true"] { background: rgba(88, 166, 255, .28); border-color: #58a6ff; color: var(--orca-foreground); font-weight: 700; box-shadow: inset 0 0 0 1px #58a6ff; }
   .logv-count { color: var(--orca-muted-foreground); font-size: 11px; }
   mark { background: rgba(210, 153, 34, .35); color: inherit; border-radius: 2px; }
   .hit { cursor: pointer; }
@@ -107,7 +107,7 @@
   .seg button:last-child { border-radius: 0 4px 4px 0; }
   .pinned-name { font-weight: 600; word-break: break-all; }
   .tree { border: 1px solid var(--orca-border); border-radius: 8px; overflow: hidden; }
-  .tree > :last-child { border-bottom: none; }
+  .tree > :last-child .tg-head, .tree > :last-child .crow, .tree > :last-child > .logv { border-bottom: none; }
   .tg-head { display: flex; align-items: baseline; gap: 6px; padding: var(--space-s) 12px var(--space-s) calc(12px + var(--d, 0) * 14px); background: var(--orca-card, rgba(255, 255, 255, .03)); border-bottom: 1px solid var(--orca-border); cursor: pointer; }
   .tg-head .tg-name { font-weight: 600; word-break: break-all; }
   .tg-head.flagged { flex-wrap: wrap; }
@@ -127,6 +127,13 @@
   .flag.quiet { color: var(--orca-muted-foreground); font-weight: 400; border-color: var(--orca-border); }
   .crow .img { font-size: 11px; color: var(--orca-muted-foreground); word-break: break-all; }
   .crow .ports { margin-top: 4px; }
+  .crow-foot { display: flex; align-items: center; flex-wrap: wrap; gap: 4px var(--space-s); }
+  .crow-foot .sub { flex: 1 1 100px; min-width: 0; }
+  .crow-acts { display: inline-flex; gap: 4px; margin-left: auto; }
+  .crow-acts button { padding: 0 8px; font-size: 11px; }
+  /* A viewer uses the full width of the tree: indenting it would waste a narrow sidebar. */
+  .titem:has(> .logv) .crow { border-bottom: none; }
+  .titem > .logv { margin: 0; padding: var(--space-m) 12px var(--space-m); border-bottom: 1px solid var(--orca-border); }
   .crow-main .more, .tg-head .more { margin-left: 4px; padding: 0 6px; border-color: transparent; background: transparent; line-height: 1.2; opacity: 0; flex: none; }
   .tg-head .count + .more { margin-left: 0; }
   .crow-main .more { margin-left: auto; }
@@ -164,6 +171,7 @@
   let logsEngine = null // engine the viewers were opened on
   let shownWorktree = null // worktree path of the last state shown
   let listUi = null // the detail view's persistent nodes: cards are updated in place, never rebuilt
+  let treeUi = null // the same for the All tree: one node per group header and container row
   const LOGS_MAX_LINES = 20000
   const SEARCH_DEBOUNCE_MS = 300
   const LOGS_HEIGHT_MIN = 120 // same limits as the worker's
@@ -539,9 +547,23 @@
     el.innerHTML = html
   }
 
+  // What holds a container's viewer: its card in the detail view, or its row in the All tree. A row without a
+  // scope has no actions, so it holds none. Nor does one that a message has replaced on screen.
+  function cardOf(id) {
+    const ui = overviewMode() ? treeUi : listUi
+    if (!ui || ui.title.parentNode !== $('content')) return null
+    if (!overviewMode()) return ui.cards.get(id) || null
+    const row = ui.nodes.get(`r:${id}`)
+    return row && row.scope ? row : null
+  }
+
+  function logButtonOf(id) {
+    const card = cardOf(id)
+    return card ? card.body.querySelector(overviewMode() ? 'button[data-row="logs"]' : 'button[data-a="logs"]') : null
+  }
+
   function markLogButton(id) {
-    const card = listUi && listUi.cards.get(id)
-    const button = card && card.body.querySelector('button[data-a="logs"]')
+    const button = logButtonOf(id)
     if (button) button.setAttribute('aria-expanded', String(viewers.has(id)))
   }
 
@@ -632,12 +654,13 @@
     $('content').innerHTML = html
   }
 
-  // A failed poll says so above the list while viewers are open, instead of destroying them.
+  // A failed poll says so above the list or tree while viewers are open, instead of destroying them.
   function showWorkerError(html) {
     const el = $('content')
-    if (!viewers.size || !listUi || listUi.list.parentNode !== el) { showMessage(html); return }
-    listUi.error.innerHTML = html
-    el.insertBefore(listUi.error, listUi.title)
+    const ui = overviewMode() ? treeUi : listUi
+    if (!viewers.size || !ui || ui.title.parentNode !== el) { showMessage(html); return }
+    ui.error.innerHTML = html
+    el.insertBefore(ui.error, ui.title)
   }
 
   // Message for a Docker/VM problem shared by both views; null when there is none.
@@ -761,62 +784,122 @@
     return `<div class="tg-head${open ? ' openable' : ''}${problems ? ' flagged' : ''}" style="--d:${depth}"${attrs}>${chev}<span class="tg-name">${esc(name)}</span>${sub ? `<span class="sub">${esc(sub)}</span>` : ''}${problems}${ctx ? opHtml(groupOps.get(ctx)) : ''}<span class="count">${esc(runningText(counts))}</span>${ctx ? moreBtn(ctx, name) : ''}</div>`
   }
 
-  // ctx = true when the row has a context menu; rows that are not openable still need a tab stop.
+  // ctx = true when the container can be acted on: context menu, logs and shell buttons. Rows that are not
+  // openable then still need a tab stop. The logs button's pressed state is set on the node (markLogButton),
+  // so opening a viewer does not rewrite the row.
   function treeRow(c, depth, open, ctx) {
     const ck = `k:${c.id}`
     const focusable = ctx && !open ? ' tabindex="0"' : ''
+    const act = (a, label, more = '') => `<button type="button" data-row="${a}" data-t="${esc(c.id)}" aria-label="${label} ${esc(c.name)}"${more}>${a}</button>`
+    const shell = c.state === 'running' ? act('shell', 'Shell in', rowOps.has(c.id) ? ' aria-disabled="true"' : '') : ''
+    const status = `<div class="sub">${esc(c.status)}</div>`
     return `<div class="crow${open ? ' openable' : ''}" style="--d:${depth}"${openAttrs(open, open ? c.id : null)}${focusable}${ctx ? ` data-ctx="${esc(ck)}"` : ''}>
         <div class="crow-main">${stIcon(c.state)}<span class="name">${esc(c.name)}</span>${markerHtml(c.marker)}<span class="img">${esc(c.image)}</span>${opHtml(rowOps.get(c.id))}${ctx ? moreBtn(ck, c.name) : ''}</div>
-        <div class="sub">${esc(c.status)}</div>
+        ${ctx ? `<div class="crow-foot">${status}<span class="crow-acts">${act('logs', 'Logs of')}${shell}</span></div>` : status}
         ${renderPorts(c.ports)}
       </div>`
   }
 
-  function renderTree(o) {
+  // The visible tree as a flat list: { key, html } per header, plus `container` per container row.
+  function treeNodes(o) {
     const out = []
+    const head = (key, ...args) => out.push({ key: `h:${key}`, html: treeHead(key, ...args) })
+    const row = (c, depth, open, ctx) => out.push({ key: `r:${c.id}`, html: treeRow(c, depth, open, ctx), container: c })
     for (const p of o.projects) {
-      out.push(treeHead(`p:${p.id}`, 0, p.name, '', p))
+      head(`p:${p.id}`, 0, p.name, '', p)
       if (!isOpen(`p:${p.id}`)) continue
       for (const w of p.worktrees) {
         const open = { kind: 'worktree', v: w.path, n: w.name, b: w.branch }
-        out.push(treeHead(`w:${w.path}`, 1, w.name, w.branch, w, open, `g:w:${w.path}`))
-        if (isOpen(`w:${w.path}`)) for (const c of w.containers) out.push(treeRow(c, 2, open, true))
+        head(`w:${w.path}`, 1, w.name, w.branch, w, open, `g:w:${w.path}`)
+        if (isOpen(`w:${w.path}`)) for (const c of w.containers) row(c, 2, open, true)
       }
     }
     if (o.other.projects.length) {
-      out.push(treeHead('other', 0, 'Other Compose projects', '', o.other))
+      head('other', 0, 'Other Compose projects', '', o.other)
       if (isOpen('other')) for (const g of o.other.projects) {
         const open = g.workdir ? { kind: 'compose', v: g.workdir, n: g.name, b: 'Compose project' } : null
         const key = `o:${encodeURIComponent(g.key)}`
-        out.push(open ? treeHead(key, 1, g.name, '', g, open, `g:c:${g.workdir}`) : treeHead(key, 1, g.name, '', g))
-        if (isOpen(key)) for (const c of g.containers) out.push(treeRow(c, 2, open, Boolean(open)))
+        if (open) head(key, 1, g.name, '', g, open, `g:c:${g.workdir}`)
+        else head(key, 1, g.name, '', g)
+        if (isOpen(key)) for (const c of g.containers) row(c, 2, open, Boolean(open))
       }
     }
     if (o.individual.containers.length) {
-      out.push(treeHead('individual', 0, 'Individual containers', '', o.individual))
-      if (isOpen('individual')) for (const c of o.individual.containers) out.push(treeRow(c, 1, null, true))
+      head('individual', 0, 'Individual containers', '', o.individual)
+      if (isOpen('individual')) for (const c of o.individual.containers) row(c, 1, null, true)
     }
-    return out.join('')
+    return out
+  }
+
+  const renderTree = (o) => treeNodes(o).map((n) => n.html).join('')
+
+  // Brings the tree's nodes up to date in place, like renderList: a node holding a viewer is never moved or
+  // rebuilt, and a viewer whose row is no longer shown (gone, or inside a collapsed group) is closed.
+  function updateTree(o) {
+    const wanted = treeNodes(o)
+    const keys = new Set(wanted.map((n) => n.key))
+    const targets = buildCtxIndex(o) // the scopes the context menu uses
+    const scopeOf = (id) => { const t = targets.get(`k:${id}`); return t ? t.scope : null }
+    for (const v of [...viewers.values()]) if (!keys.has(`r:${v.id}`) || !scopeOf(v.id)) closeViewer(v)
+    for (const [key, node] of treeUi.nodes) if (!keys.has(key)) { node.el.remove(); treeUi.nodes.delete(key) }
+    const els = wanted.map(({ key, html, container: c }) => {
+      let node = treeUi.nodes.get(key)
+      if (!node) {
+        const body = h('div', { className: 'tnode-body' })
+        node = { body, el: c ? h('div', { className: 'titem', data: { cid: c.id, key } }, body) : h('div', { data: { key } }, body) }
+        treeUi.nodes.set(key, node)
+      }
+      const rewritten = node.body.renderedHtml !== html
+      setHtml(node.body, html)
+      if (!c) return node.el
+      node.name = c.name
+      node.scope = scopeOf(c.id)
+      const v = viewers.get(c.id)
+      if (v) {
+        if (v.name !== c.name) setViewerName(v, c.name)
+        // Without the worktree list the grouping is a fallback: keep the scope the viewer was opened with.
+        if (!o.orcaError) v.scope = node.scope
+      }
+      if (rewritten) markLogButton(c.id)
+      return node.el
+    })
+    placeInOrder(treeUi.tree, els)
   }
 
   function renderOverview() {
     const el = $('content')
     pruneStaleOps()
-    if (!overview) { el.innerHTML = '<div class="msg"><span class="spin"></span> Loading containers…</div>'; return }
+    if (!overview) { showMessage('<div class="msg"><span class="spin"></span> Loading containers…</div>'); return }
     const problem = dockerProblemHtml(overview.error)
-    if (problem) { el.innerHTML = problem; closeMenu(false); return }
+    if (problem) { showMessage(problem); closeMenu(false); return }
     const n = overview.projects.reduce((a, p) => a + p.total, 0) + overview.other.total + overview.individual.total
     const running = overview.projects.reduce((a, p) => a + p.running, 0) + overview.other.running + overview.individual.running
     const title = `<div class="section-title">Containers <span class="count">${running}/${n} running</span></div>`
     const warn = overview.orcaError ? `<div class="msg">${esc(overview.orcaError)} Worktree grouping is unavailable.</div>` : ''
-    const ae = document.activeElement
-    const focusRow = ae && el.contains(ae) && ae.closest ? ae.closest('[data-ctx]') : null
-    const focusKey = focusRow ? focusRow.dataset.ctx : null
-    const focusMore = Boolean(focusKey && ae.classList.contains('more'))
-    el.innerHTML = n === 0 ? `${title}${warn}<div class="msg">No containers.</div>` : `${title}${warn}<div class="tree">${renderTree(overview)}</div>`
-    if (focusKey && !menu) {
-      const next = Array.from(el.querySelectorAll('[data-ctx]')).find((x) => x.dataset.ctx === focusKey)
-      const target = next && (focusMore ? next.querySelector('.more') : next)
+    if (n === 0) { showMessage(`${title}${warn}<div class="msg">No containers.</div>`); syncMenu(); return }
+    // Focus on a header, row or one of their controls survives a rewrite; a viewer's own focus is never touched.
+    const active = document.activeElement
+    const holder = active && el.contains(active) && active.closest && !active.closest('.logv') ? active.closest('[data-key]') : null
+    // `held` names the focused control inside the header or row; none when that element itself has the focus.
+    const held = holder && active !== holder.firstElementChild.firstElementChild
+      ? ['row', 'copy', 'more', 'toggle'].find((k) => active.dataset[k] !== undefined)
+      : undefined
+    const heldKey = holder && holder.dataset.key
+    const heldValue = held && active.dataset[held]
+    if (!treeUi || treeUi.tree.parentNode !== el) {
+      el.textContent = ''
+      treeUi = { title: h('div'), warn: h('div'), tree: h('div', { className: 'tree' }), error: h('div'), nodes: new Map() }
+      el.append(treeUi.title, treeUi.warn, treeUi.tree)
+    }
+    treeUi.error.remove()
+    setHtml(treeUi.title, title)
+    setHtml(treeUi.warn, warn)
+    updateTree(overview)
+    if (holder && !menu && document.activeElement !== active) {
+      const node = treeUi.nodes.get(heldKey)
+      const target = node && (held
+        ? Array.from(node.body.querySelectorAll(`[data-${held}]`)).find((x) => x.dataset[held] === heldValue)
+        : node.body.firstElementChild)
       if (target) target.focus({ preventScroll: true })
     }
     syncMenu()
@@ -826,15 +909,11 @@
   function applyFocus() {
     if (!pinned || pinned.focusDone || !state || searching) return
     pinned.focusDone = true
-    const logsFor = pinned.autoLogs
-    pinned.autoLogs = null
     const el = pinned.focusId ? Array.from(document.querySelectorAll('.item[data-cid]')).find((x) => x.dataset.cid === pinned.focusId) : null
     if (el) {
       el.scrollIntoView({ block: 'center' })
       el.classList.add('flash')
     }
-    // Opened from the context menu's "Logs": follow that container's logs straight away.
-    if (logsFor && state.containers.some((c) => c.id === logsFor)) openLogs(logsFor)
   }
 
   function render() {
@@ -947,6 +1026,8 @@
     if (adoptEngine(nextVm, nextOverview)) return
     engineCounts = nextOverview.engineCounts || null
     overview = nextOverview
+    // The VM is going down: nothing to follow or search any more.
+    if (vm && (vm.op === 'stopping' || vm.op === 'restarting')) closeAllLogs()
     render()
   }
 
@@ -1015,7 +1096,7 @@
 
   function openScope(d) {
     const scope = d.open === 'worktree' ? { kind: 'worktree', path: d.v } : d.open === 'container' ? { kind: 'container', id: d.v } : { kind: 'compose', workdir: d.v }
-    pinned = { scope, name: d.n, sub: d.b, focusId: d.cid || null, focusDone: false, autoLogs: d.logs ? d.cid : null }
+    pinned = { scope, name: d.n, sub: d.b, focusId: d.cid || null, focusDone: false }
     resetDetail()
     render()
     refresh()
@@ -1078,6 +1159,7 @@
     return {
       id,
       name: id,
+      scope: null, // the row's scope in the All view; in the detail view request() adds the pinned one
       els,
       el: h('div', { className: 'logv', data: { logs: id } }, head, els.note, els.search, els.box, els.resize),
       live: false, // a follower is running
@@ -1165,11 +1247,14 @@
     await openLogs(id)
   }
 
-  // Opens a viewer inside the container's card, closing the oldest one when there are too many.
+  // What every request about one viewer carries.
+  const viewerInput = (v, more) => ({ id: v.id, ...(v.scope && { scope: v.scope }), ...more })
+
+  // Opens a viewer inside the container's card or row, closing the oldest one when there are too many.
   async function openLogs(id) {
     const open = viewers.get(id)
     if (open) { revealViewer(open); return }
-    const card = listUi && listUi.cards.get(id)
+    const card = cardOf(id)
     if (!card) return
     let evicted = null
     if (viewers.size >= MAX_VIEWERS) {
@@ -1178,6 +1263,7 @@
     }
     const v = createViewer(id)
     setViewerName(v, card.name)
+    v.scope = card.scope || null
     viewers.set(id, v)
     card.el.appendChild(v.el)
     applyLogsHeight(v)
@@ -1201,7 +1287,7 @@
     updateModeUi(v)
     setLogsState(v, true)
     try {
-      const r = await request('colima.logs.follow', { id: v.id })
+      const r = await request('colima.logs.follow', viewerInput(v))
       if (!isOpenViewer(v) || epoch !== v.epoch) return // closed or switched while the worker was answering
       if (!r.ok) { setStatus(r.message); closeViewer(v) }
     } catch (err) {
@@ -1214,7 +1300,7 @@
   async function startHistory(v) {
     const epoch = ++v.epoch
     v.mode = 'history'
-    stopWorkerLogs({ id: v.id }) // follower (and any search) off
+    stopWorkerLogs(viewerInput(v)) // follower (and any search) off
     resetLogView(v)
     updateModeUi(v)
     setLogsState(v, false)
@@ -1238,7 +1324,7 @@
   function closeViewer(v) {
     if (!isOpenViewer(v)) return
     dropViewer(v)
-    stopWorkerLogs({ id: v.id })
+    stopWorkerLogs(viewerInput(v))
   }
 
   function closeAllLogs() {
@@ -1317,7 +1403,7 @@
     button.disabled = true
     setStatus('Opening terminal…')
     try {
-      const r = await request('colima.logs.terminal', { id: v.id })
+      const r = await request('colima.logs.terminal', viewerInput(v))
       if (r.ok) setStatus('Logs opened in a new terminal', 3000)
       else setStatus(r.message ? `Open in terminal failed: ${r.message}` : '', 10000)
     } catch (err) { setStatus(`Open in terminal failed: ${err.message}`, 10000) }
@@ -1360,6 +1446,8 @@
     logsDrag.moved = true
     logsHeightChosen = true
     setLogsHeight(logsDrag.height + e.clientY - logsDrag.y)
+    // A log growing past the bottom edge would grow out of sight: the page follows the bar.
+    logsDrag.viewer.els.resize.scrollIntoView({ block: 'nearest' })
   })
   document.addEventListener('pointerup', endLogsDrag)
   document.addEventListener('pointercancel', endLogsDrag)
@@ -1466,7 +1554,7 @@
     v.olderBusy = true
     updateOlderBar(v)
     try {
-      const r = await request('colima.logs.older', { id: v.id, until, skip: initialUntil ? 0 : shownAt(v, until) })
+      const r = await request('colima.logs.older', viewerInput(v, { until, skip: initialUntil ? 0 : shownAt(v, until) }))
       if (!current()) return
       if (!r.ok) { setStatus(`older logs failed: ${r.message}`); return }
       const lines = r.text ? r.text.split('\n').filter((l) => l !== '') : []
@@ -1551,7 +1639,7 @@
     updateNav(v)
     if (v.mode === 'history') {
       setLogsView(v, 'tail')
-      stopWorkerLogs({ id: v.id }) // aborts a running search
+      stopWorkerLogs(viewerInput(v)) // aborts a running search
     }
   }
 
@@ -1565,7 +1653,7 @@
     const current = () => seq === v.searchSeq && isOpenViewer(v) && epoch === v.epoch
     v.els.count.innerHTML = '<span class="spin"></span> Searching…'
     try {
-      const r = await request('colima.logs.search', { id: v.id, query, caseSensitive })
+      const r = await request('colima.logs.search', viewerInput(v, { query, caseSensitive }))
       if (!current()) return // superseded
       if (!r.ok) {
         v.els.count.textContent = r.message || (r.cancelled ? 'Search cancelled.' : 'Search failed.')
@@ -1595,7 +1683,7 @@
     const epoch = v.epoch
     v.resultsScroll = v.els.box.scrollTop
     try {
-      const r = await request('colima.logs.context', { id: v.id, ts })
+      const r = await request('colima.logs.context', viewerInput(v, { ts }))
       if (!isOpenViewer(v) || epoch !== v.epoch) return
       if (!r.ok) { setStatus(`context failed: ${r.message}`); return }
       const box = v.els.context
@@ -1624,8 +1712,7 @@
     const lv = control.dataset.lv
     if (lv === 'close') {
       closeViewer(v)
-      const card = listUi && listUi.cards.get(v.id)
-      const button = card && card.body.querySelector('button[data-a="logs"]')
+      const button = logButtonOf(v.id)
       if (button) button.focus({ preventScroll: true })
     } else if (lv === 'expand') toggleExpanded(v)
     else if (lv === 'terminal') await openLogsTerminal(v)
@@ -1713,6 +1800,15 @@
     const link = e.target.closest('.port.link')
     if (link) { await copyPort(link.dataset.copy); return }
     // (Enter/Space on a focused chip is handled by the keydown listener below.)
+    // A row's own buttons come before the row, which opens the detail view.
+    const act = e.target.closest('[data-row]')
+    if (act) {
+      const { row, t } = act.dataset
+      if (row === 'logs') { await toggleLogs(t); return }
+      const target = resolveCtx(`k:${t}`)
+      if (target && !rowOps.has(t)) await containerAction(target, row)
+      return
+    }
     const tog = e.target.closest('[data-toggle]')
     if (tog) { toggleGroup(tog.dataset.toggle); return }
     const opener = e.target.closest('[data-open]')
@@ -2040,7 +2136,7 @@
 
   async function containerAction(t, id) {
     const c = t.c
-    if (id === 'logs') { openScope({ open: t.scopeKind, v: t.v, n: t.name, b: t.sub, cid: c.id, logs: true }); return }
+    if (id === 'logs') { await toggleLogs(c.id); return }
     rowOps.set(c.id, { label: ROW_OP_LABELS[id] || 'Working…', at: Date.now() })
     if (overviewMode()) renderOverview()
     try {
